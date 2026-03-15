@@ -244,6 +244,10 @@ func (c *SshUdpClient) Close() error {
 		return nil
 	}
 
+	// ROOTSHELL: Clear attachable so forwardInput sends CloseWrite for
+	// intentional shutdowns. Abandon() leaves it set to preserve the session.
+	c.attachable.Store(false)
+
 	_, _ = doWithTimeout(func() (int, error) {
 		if c.busStream == nil {
 			return 0, nil
