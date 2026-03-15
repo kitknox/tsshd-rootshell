@@ -375,6 +375,13 @@ func (s *sshUdpServer) attachSession(stream Stream, msg *startMessage) (*session
 	// are ready when the client checker reports the client reconnected.
 	sess.clientChecker.swap(s.clientChecker)
 
+	// ROOTSHELL: Restart forwardInput for the new stream. The previous forwardInput
+	// goroutine exited when the old stream broke (KCP timeout), but didn't close
+	// stdin (attachable mode). Start a fresh one to read from the new stream.
+	if sess.stdin != nil {
+		go sess.forwardInput(sess.ioStream)
+	}
+
 	if sess.pty != nil {
 		if msg.Cols > 0 && msg.Rows > 0 {
 			sess.cols, sess.rows = msg.Cols, msg.Rows

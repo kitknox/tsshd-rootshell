@@ -204,7 +204,12 @@ func (c *sessionContext) discardPendingInput(server *sshUdpServer, buf []byte) e
 
 func (c *sessionContext) forwardInput(stream Stream) {
 	defer func() {
-		_ = c.stdin.Close()
+		// ROOTSHELL: In attachable mode, don't close stdin — the shell should persist
+		// for future Attach(). Shell lifetime is managed by Wait() + Close().
+		// attachSession() restarts forwardInput with the new stream.
+		if c.ioStream == nil {
+			_ = c.stdin.Close()
+		}
 		_ = stream.CloseRead()
 	}()
 	buffer := make([]byte, 32*1024)
