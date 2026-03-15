@@ -60,6 +60,9 @@ type rotatingCrypto struct {
 	closed           atomic.Bool
 	stopCh           chan struct{}
 	delegatedToProxy bool
+	// ROOTSHELL: Suppress rekey during iOS app background to prevent accumulated
+	// time.Ticker ticks from firing multiple rekeys on resume, causing GCM auth failures.
+	suppressRekey atomic.Bool
 }
 
 func (r *rotatingCrypto) NonceSize() int {
@@ -249,6 +252,12 @@ func (r *rotatingCrypto) startRekey() {
 		return
 	}
 
+	// ROOTSHELL: Skip rekey when suppressed (iOS app is backgrounded).
+	if r.suppressRekey.Load() {
+		r.rekeyInFlight.Store(false)
+		return
+	}
+
 	err := func() error {
 		curve := ecdh.P256()
 		clientPriKey, err := curve.GenerateKey(crypto_rand.Reader)
@@ -342,6 +351,10 @@ func newRotatingCrypto(client *SshUdpClient, pass, salt []byte, bytesThreshold u
 			for {
 				select {
 				case <-ticker.C:
+					// ROOTSHELL: Skip accumulated ticks while suppressed (iOS background).
+					if r.suppressRekey.Load() {
+						continue
+					}
 					r.debug("time-based rekey triggered: threshold [%v]", timeThreshold)
 					r.startRekey()
 

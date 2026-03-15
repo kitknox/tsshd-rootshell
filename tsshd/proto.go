@@ -390,6 +390,8 @@ type protocolClient interface {
 	getUdpForwarder() *udpForwarder
 	handleRekeyEvent(msg *rekeyMessage) error
 	newStream(connectTimeout time.Duration) (Stream, error)
+	// ROOTSHELL: Suppress/resume rekey for iOS background/foreground transitions.
+	suppressRekey(suppress bool)
 }
 
 type kcpClient struct {
@@ -411,6 +413,11 @@ func (c *kcpClient) getUdpForwarder() *udpForwarder {
 
 func (c *kcpClient) handleRekeyEvent(msg *rekeyMessage) error {
 	return c.crypto.handleClientRekey(msg)
+}
+
+// ROOTSHELL: Suppress/resume rekey for iOS background/foreground transitions.
+func (c *kcpClient) suppressRekey(suppress bool) {
+	c.crypto.suppressRekey.Store(suppress)
 }
 
 func (c *kcpClient) newStream(connectTimeout time.Duration) (Stream, error) {
@@ -439,6 +446,9 @@ func (c *quicClient) handleRekeyEvent(msg *rekeyMessage) error {
 	// rekey is handled by QUIC internally
 	return nil
 }
+
+// ROOTSHELL: No-op for QUIC — rekey is handled internally by QUIC.
+func (c *quicClient) suppressRekey(suppress bool) {}
 
 func (c *quicClient) newStream(connectTimeout time.Duration) (Stream, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)

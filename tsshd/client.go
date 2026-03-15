@@ -446,6 +446,24 @@ func (c *SshUdpClient) SetKeepPendingOutput(keep bool) error {
 	return c.sendBusMessage("setting", settingsMessage{KeepPendingOutput: &keep})
 }
 
+// ROOTSHELL: SuppressRekey disables rekey during iOS app background to prevent
+// accumulated time.Ticker ticks from firing multiple rekeys on resume.
+func (c *SshUdpClient) SuppressRekey() {
+	c.protoClient.suppressRekey(true)
+}
+
+// ROOTSHELL: ResumeRekey re-enables rekey after iOS app returns to foreground.
+func (c *SshUdpClient) ResumeRekey() {
+	c.protoClient.suppressRekey(false)
+}
+
+// ROOTSHELL: SendKeepAlive sends an immediate keepalive to accelerate session
+// resumption after iOS app returns to foreground.
+func (c *SshUdpClient) SendKeepAlive() {
+	aliveTime := time.Now().UnixMilli()
+	_ = c.sendBusMessage("alive", aliveMessage{aliveTime})
+}
+
 // IsClosed returns whether the client has closed
 func (c *SshUdpClient) IsClosed() bool {
 	return c.closed.Load()
@@ -525,7 +543,14 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 	ticker := time.NewTicker(intervalTime)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		// ROOTSHELL: Check busClosed alongside ticker to exit early when bus dies.
+		select {
+		case <-ticker.C:
+		case <-c.busClosed:
+			return
+		}
+
 		if c.IsClosed() {
 			return
 		}
@@ -542,7 +567,16 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 			c.debug("keep alive [%d] sent success", aliveTime)
 		}
 
-		ackTime := <-c.activeAckChan
+		// ROOTSHELL: Timeout on ACK wait to prevent indefinite blocking during iOS
+		// suspension. If no ACK arrives within 2 intervals, continue to next tick.
+		var ackTime int64
+		select {
+		case ackTime = <-c.activeAckChan:
+		case <-time.After(2 * intervalTime):
+			continue
+		case <-c.busClosed:
+			return
+		}
 		c.activeChecker.updateTime(ackTime)
 
 		if c.pendingClearPkt.Load() {
@@ -706,7 +740,12 @@ func (c *SshUdpClient) handleAliveEvent() {
 		return
 	}
 
-	c.activeAckChan <- aliveMsg.Time
+	// ROOTSHELL: Non-blocking send to prevent handleBusEvent from stalling
+	// when keepAlive is blocked (e.g., during iOS suspension).
+	select {
+	case c.activeAckChan <- aliveMsg.Time:
+	default:
+	}
 }
 
 func (c *SshUdpClient) handleDiscardEvent() {
