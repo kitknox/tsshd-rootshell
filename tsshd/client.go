@@ -279,6 +279,26 @@ func (c *SshUdpClient) Close() error {
 	return err
 }
 
+// Abandon silently disconnects without sending "close" to the server.
+// Used for iOS attachable mode: the server keeps the session alive for future Attach().
+func (c *SshUdpClient) Abandon() {
+	if !c.closed.CompareAndSwap(false, true) {
+		return
+	}
+
+	// Close bus stream locally without sending "close" command
+	if c.busStream != nil {
+		_ = c.busStream.Close()
+	}
+
+	// Close protocol client (KCP/QUIC session)
+	_ = c.protoClient.closeClient()
+
+	// Close proxy
+	_ = c.clientProxy.Close()
+	c.activeChecker.Close()
+}
+
 func (c *SshUdpClient) newStream(cmd string) (Stream, error) {
 	stream, err := c.protoClient.newStream(c.connectTimeout)
 	if err != nil {
