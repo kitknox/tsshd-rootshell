@@ -84,6 +84,9 @@ type SshUdpClient struct {
 	reconnectMutex  sync.Mutex
 	reconnectError  atomic.Pointer[error]
 	pendingClearPkt atomic.Bool
+	// ROOTSHELL: When set, forwardInput skips CloseWrite on exit so the server
+	// keeps the session alive for future Attach(). Set via SetAttachable().
+	attachable atomic.Bool
 }
 
 // UdpClientOptions contains all configuration parameters required to create and initialize a new SshUdpClient
@@ -464,6 +467,13 @@ func (c *SshUdpClient) SetKeepPendingInput(keep bool) error {
 // SetKeepPendingOutput sets whether to keep the pending output during disconnection.
 func (c *SshUdpClient) SetKeepPendingOutput(keep bool) error {
 	return c.sendBusMessage("setting", settingsMessage{KeepPendingOutput: &keep})
+}
+
+// ROOTSHELL: SetAttachable marks this client as using attachable mode.
+// When set, forwardInput won't send CloseWrite on exit, preserving the
+// server session for future Attach() by a new client.
+func (c *SshUdpClient) SetAttachable(attachable bool) {
+	c.attachable.Store(attachable)
 }
 
 // ROOTSHELL: SuppressRekey disables rekey during iOS app background to prevent
@@ -948,8 +958,17 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 func (s *SshUdpSession) forwardInput() {
 	defer func() {
 		_ = s.stdin.Close()
-		if err := s.stream.CloseWrite(); err != nil {
-			s.client.debug("session [%d] close write failed: %v", s.id, err)
+		// ROOTSHELL: When attachable is set, don't send CloseWrite — this would
+		// propagate EOF to the server's forwardInput, closing PTY stdin and killing
+		// the shell. Let the connection die silently so the server keeps the session
+		// alive for future Attach(). Only suppress in attachable mode; normal sessions
+		// need CloseWrite for clean shutdown.
+		if !s.client.attachable.Load() {
+			if err := s.stream.CloseWrite(); err != nil {
+				s.client.debug("session [%d] close write failed: %v", s.id, err)
+			}
+		} else {
+			s.client.debug("session [%d] skipping CloseWrite (attachable mode)", s.id)
 		}
 	}()
 	buffer := make([]byte, 32*1024)
