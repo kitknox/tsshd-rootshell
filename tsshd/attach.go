@@ -92,19 +92,6 @@ func (s *replaceableStream) do(fn func(Stream) error) error {
 
 		s.mu.Lock()
 		switched := s.stream != cur
-
-		// When the stream errors without being replaced (e.g., KCP timeout after
-		// client force-quit), self-detach by nilling the stream and waiting for a
-		// replacement via swap(). Without this, both forwardInput and forwardOutput
-		// would exit — forwardInput closing stdin, forwardOutput triggering Wait()
-		// → Close() — killing the shell before a new client can Attach().
-		if !switched && err != nil {
-			s.stream = nil
-			s.mu.Unlock()
-			_ = cur.Close()
-			continue
-		}
-
 		s.mu.Unlock()
 
 		if switched {
