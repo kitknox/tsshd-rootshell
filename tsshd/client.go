@@ -565,14 +565,7 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 	ticker := time.NewTicker(intervalTime)
 	defer ticker.Stop()
 
-	for {
-		// ROOTSHELL: Check busClosed alongside ticker to exit early when bus dies.
-		select {
-		case <-ticker.C:
-		case <-c.busClosed:
-			return
-		}
-
+	for range ticker.C {
 		if c.IsClosed() {
 			return
 		}
@@ -591,16 +584,7 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 			}
 		}
 
-		// ROOTSHELL: Timeout on ACK wait to prevent indefinite blocking during iOS
-		// suspension. If no ACK arrives within 2 intervals, continue to next tick.
-		var ackTime int64
-		select {
-		case ackTime = <-c.activeAckChan:
-		case <-time.After(2 * intervalTime):
-			continue
-		case <-c.busClosed:
-			return
-		}
+		ackTime := <-c.activeAckChan
 
 		if c.enableDebugging {
 			timeout, stabilizing, rtt := c.activeChecker.isTimeout(), c.pendingClearPkt.Load(), time.Since(time.UnixMilli(ackTime))
@@ -767,12 +751,7 @@ func (c *SshUdpClient) handleAliveEvent() {
 		return
 	}
 
-	// ROOTSHELL: Non-blocking send to prevent handleBusEvent from stalling
-	// when keepAlive is blocked (e.g., during iOS suspension).
-	select {
-	case c.activeAckChan <- aliveMsg.Time:
-	default:
-	}
+	c.activeAckChan <- aliveMsg.Time
 }
 
 func (c *SshUdpClient) handleDiscardEvent() {
