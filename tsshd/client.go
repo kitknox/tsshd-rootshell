@@ -474,14 +474,6 @@ func (c *SshUdpClient) SetKeepPendingOutput(keep bool) error {
 func (c *SshUdpClient) SetAttachable(attachable bool) {
 	c.attachable.Store(attachable)
 }
-
-// ROOTSHELL: SendKeepAlive sends an immediate keepalive to accelerate session
-// resumption after iOS app returns to foreground.
-func (c *SshUdpClient) SendKeepAlive() {
-	aliveTime := time.Now().UnixMilli()
-	_ = c.sendBusMessage("alive", aliveMessage{aliveTime})
-}
-
 // IsClosed returns whether the client has closed
 func (c *SshUdpClient) IsClosed() bool {
 	return c.closed.Load()
