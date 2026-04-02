@@ -86,9 +86,6 @@ type SshUdpClient struct {
 	reconnectError   atomic.Pointer[error]
 	pendingClearPkt  atomic.Bool
 	keepPendingInput atomic.Bool
-	// ROOTSHELL: When set, forwardInput skips CloseWrite on exit so the server
-	// keeps the session alive for future Attach(). Set via SetAttachable().
-	attachable atomic.Bool
 }
 
 // UdpClientOptions contains all configuration parameters required to create and initialize a new SshUdpClient
@@ -247,10 +244,6 @@ func (c *SshUdpClient) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-
-	// ROOTSHELL: Clear attachable so forwardInput sends CloseWrite for
-	// intentional shutdowns. Abandon() leaves it set to preserve the session.
-	c.attachable.Store(false)
 
 	_, _ = doWithTimeout(func() (int, error) {
 		if c.busStream == nil {
@@ -468,12 +461,6 @@ func (c *SshUdpClient) SetKeepPendingOutput(keep bool) error {
 	return c.sendBusMessage("setting", settingsMessage{KeepPendingOutput: &keep})
 }
 
-// ROOTSHELL: SetAttachable marks this client as using attachable mode.
-// When set, forwardInput won't send CloseWrite on exit, preserving the
-// server session for future Attach() by a new client.
-func (c *SshUdpClient) SetAttachable(attachable bool) {
-	c.attachable.Store(attachable)
-}
 // IsClosed returns whether the client has closed
 func (c *SshUdpClient) IsClosed() bool {
 	return c.closed.Load()
@@ -947,17 +934,8 @@ func (s *SshUdpSession) forwardInput() {
 	defer func() {
 		s.client.debug("session [%d] stdin completed", s.id)
 		_ = s.stdin.Close()
-		// ROOTSHELL: When attachable is set, don't send CloseWrite — this would
-		// propagate EOF to the server's forwardInput, closing PTY stdin and killing
-		// the shell. Let the connection die silently so the server keeps the session
-		// alive for future Attach(). Only suppress in attachable mode; normal sessions
-		// need CloseWrite for clean shutdown.
-		if !s.client.attachable.Load() {
-			if err := s.stream.CloseWrite(); err != nil {
-				s.client.debug("session [%d] close write failed: %v", s.id, err)
-			}
-		} else {
-			s.client.debug("session [%d] skipping CloseWrite (attachable mode)", s.id)
+		if err := s.stream.CloseWrite(); err != nil {
+			s.client.debug("session [%d] close write failed: %v", s.id, err)
 		}
 	}()
 
