@@ -41,6 +41,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/shlex"
 	"github.com/trzsz/shellescape"
 )
 
@@ -199,7 +200,9 @@ func (c *sessionContext) discardPendingInput(server *sshUdpServer, buf []byte, m
 		if enableDebugLogging {
 			debug("discard input: %s", strconv.QuoteToASCII(string(c.discardedBuffer[:pos])))
 		}
-		_ = server.sendBusMessage("discard", discardMessage{DiscardedInput: c.discardedBuffer[:pos]})
+		if err := server.sendBusMessage("discard", discardMessage{DiscardedInput: c.discardedBuffer[:pos]}); err != nil {
+			warning("send discard message failed: %v", err)
+		}
 	} else if enableDebugLogging {
 		debug("no pending input to discard")
 	}
@@ -648,7 +651,9 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	defer c.resizeMutex.Unlock()
 
 	if redraw {
-		_ = c.pty.Resize(cols+1, rows)
+		if err := c.pty.Resize(cols+1, rows); err != nil {
+			warning("redraw pty failed: %v", err)
+		}
 		time.Sleep(10 * time.Millisecond) // fix redraw issue in `screen`
 		debug("session [%d] redraw: %d, %d", c.id, cols, rows)
 	} else {
@@ -656,7 +661,7 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	}
 
 	if err := c.pty.Resize(cols, rows); err != nil {
-		return fmt.Errorf("pty set size failed: %v", err)
+		return fmt.Errorf("resize pty failed: %v", err)
 	}
 
 	c.cols, c.rows = cols, rows
@@ -848,23 +853,7 @@ func getSessionStartCmd(msg *startMessage) (*exec.Cmd, error) {
 		return getSubsystemCmd(msg.Subs)
 	}
 
-	var envs []string
-	for _, env := range os.Environ() {
-		pos := strings.IndexRune(env, '=')
-		if pos <= 0 {
-			continue
-		}
-		name := strings.TrimSpace(env[:pos])
-		if name == kEnvTsshdBackground {
-			continue
-		}
-		if _, ok := msg.Envs[name]; !ok {
-			envs = append(envs, env)
-		}
-	}
-	for key, value := range msg.Envs {
-		envs = append(envs, fmt.Sprintf("%s=%s", key, value))
-	}
+	envs := getEnvironments(msg)
 
 	if !msg.Shell {
 		name := msg.Name
@@ -917,6 +906,72 @@ func getSessionStartCmd(msg *startMessage) (*exec.Cmd, error) {
 	}
 	cmd.Env = envs
 	return cmd, nil
+}
+
+func getEnvironments(msg *startMessage) []string {
+	var envs []string
+
+	var acceptEnvExpr string
+	acceptEnv := getSshdConfig("AcceptEnv")
+	if acceptEnv != "" {
+		patterns, err := shlex.Split(acceptEnv)
+		if err != nil {
+			warning("split AcceptEnv [%s] failed: %v", acceptEnv, err)
+		} else {
+			var buf strings.Builder
+			for _, pattern := range patterns {
+				if buf.Len() > 0 {
+					buf.WriteByte('|')
+				}
+				buf.WriteByte('(')
+				buf.WriteString(wildcardToRegexp(pattern))
+				buf.WriteByte(')')
+			}
+			acceptEnvExpr = buf.String()
+			debug("accept env regexp: %s", acceptEnvExpr)
+		}
+	}
+
+	var acceptEnvRegexp *regexp.Regexp
+	if acceptEnvExpr != "" {
+		var err error
+		acceptEnvRegexp, err = regexp.Compile(acceptEnvExpr)
+		if err != nil {
+			warning("compile AcceptEnv [%s] regexp [%s] failed: %v", acceptEnv, acceptEnvExpr, err)
+		}
+	}
+
+	acceptMap := make(map[string]struct{})
+	for name, value := range msg.Envs {
+		if name == "TERM" { // always allow TERM from pty-req
+			acceptMap[name] = struct{}{}
+			envs = append(envs, fmt.Sprintf("%s=%s", name, value))
+			continue
+		}
+		if acceptEnvRegexp == nil || !acceptEnvRegexp.MatchString(name) {
+			debug("ignore env: %s=%s", name, value)
+			continue
+		}
+		debug("accept env: %s=%s", name, value)
+		acceptMap[name] = struct{}{}
+		envs = append(envs, fmt.Sprintf("%s=%s", name, value))
+	}
+
+	for _, env := range os.Environ() {
+		pos := strings.IndexRune(env, '=')
+		if pos <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(env[:pos])
+		if name == kEnvTsshdBackground {
+			continue
+		}
+		if _, ok := acceptMap[name]; !ok {
+			envs = append(envs, env)
+		}
+	}
+
+	return envs
 }
 
 func getSubsystemCmd(name string) (*exec.Cmd, error) {
@@ -1019,7 +1074,11 @@ func (c *sessionContext) handleX11Request(msg *startMessage) {
 	if err := writeXauthData(xauthPath, xauthInput); err != nil {
 		warning("write xauth data failed: %v", err)
 	}
-	addOnExitFunc(func() { _ = writeXauthData(xauthPath, fmt.Sprintf("remove %s\n", authDisplay)) })
+	addOnExitFunc(func() {
+		if err := writeXauthData(xauthPath, fmt.Sprintf("remove %s\n", authDisplay)); err != nil {
+			warning("remove xauth data failed: %v", err)
+		}
+	})
 
 	for _, listener := range listeners {
 		go c.handleChannelAccept(listener, msg.X11.ChannelType)
