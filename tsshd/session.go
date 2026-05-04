@@ -98,6 +98,7 @@ type sessionContext struct {
 	rows            int
 	cmd             *exec.Cmd
 	pty             *tsshdPty
+	mwSess          *middlewareSession
 	outWG           sync.WaitGroup
 	stdin           io.WriteCloser
 	stdout          io.ReadCloser
@@ -118,6 +119,28 @@ type sessionContext struct {
 
 var sessionMutex sync.Mutex
 var sessionMap map[uint64]*sessionContext
+
+func (c *sessionContext) StartMiddleware() error {
+	stdinReader, stdinWriter := io.Pipe()
+	stdoutReader, stdoutWriter := io.Pipe()
+	stderrReader, stderrWriter := io.Pipe()
+	c.stdin, c.stdout, c.stderr = stdinWriter, stdoutReader, stderrReader
+	c.mwSess.stdin, c.mwSess.stdout, c.mwSess.stderr = stdinReader, stdoutWriter, stderrWriter
+
+	if sessionHandler == nil {
+		return fmt.Errorf("no session handler")
+	}
+
+	go func() {
+		sessionHandler(c.mwSess)
+		_ = c.mwSess.Exit(0)
+	}()
+
+	c.started = true
+	debug("session [%d] start middleware success", c.id)
+
+	return nil
+}
 
 func (c *sessionContext) StartPty() error {
 	var err error
@@ -575,7 +598,7 @@ func (c *sessionContext) forwardIO(server *sshUdpServer, stream Stream) {
 
 func (c *sessionContext) Wait() {
 	// windows pty only close the stdout in pty.Wait
-	if runtime.GOOS == "windows" && c.pty != nil {
+	if runtime.GOOS == "windows" && c.mwSess == nil && c.pty != nil {
 		_ = c.pty.Wait()
 		c.outWG.Wait()
 		debug("session [%d] wait completed", c.id)
@@ -593,7 +616,9 @@ func (c *sessionContext) Wait() {
 	case <-time.After(time.Second):
 	}
 
-	if c.pty != nil {
+	if c.mwSess != nil {
+		_ = c.mwSess.Wait()
+	} else if c.pty != nil {
 		_ = c.pty.Wait()
 	} else {
 		_ = c.cmd.Wait()
@@ -613,8 +638,12 @@ func (c *sessionContext) Close() {
 		return
 	}
 
-	var code int
-	if c.pty != nil {
+	code := -1
+	if c.mwSess != nil {
+		if exitCode := c.mwSess.exitCode.Load(); exitCode != nil {
+			code = *exitCode
+		}
+	} else if c.pty != nil {
 		code = c.pty.GetExitCode()
 	} else {
 		code = c.cmd.ProcessState.ExitCode()
@@ -629,7 +658,10 @@ func (c *sessionContext) Close() {
 	debug("session [%d] exit completed", c.id)
 
 	if c.started {
-		if c.pty != nil {
+		if c.mwSess != nil {
+			_ = c.mwSess.Close()
+			debug("session [%d] middleware closed", c.id)
+		} else if c.pty != nil {
 			_ = c.pty.Close()
 			debug("session [%d] pty closed", c.id)
 		} else {
@@ -643,15 +675,24 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	if c.closed.Load() {
 		return nil
 	}
-	if c.pty == nil {
-		return fmt.Errorf("session %d %v is not pty", c.id, c.cmd.Args)
+
+	var resize func(cols, rows int) error
+	if c.mwSess != nil {
+		if c.mwSess.pty {
+			resize = c.mwSess.Resize
+		}
+	} else if c.pty != nil {
+		resize = c.pty.Resize
+	}
+	if resize == nil {
+		return fmt.Errorf("session %d is not pty", c.id)
 	}
 
 	c.resizeMutex.Lock()
 	defer c.resizeMutex.Unlock()
 
 	if redraw {
-		if err := c.pty.Resize(cols+1, rows); err != nil {
+		if err := resize(cols+1, rows); err != nil {
 			warning("redraw pty failed: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond) // fix redraw issue in `screen`
@@ -660,7 +701,7 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 		debug("session [%d] resize: %d, %d", c.id, cols, rows)
 	}
 
-	if err := c.pty.Resize(cols, rows); err != nil {
+	if err := resize(cols, rows); err != nil {
 		return fmt.Errorf("resize pty failed: %v", err)
 	}
 
@@ -719,7 +760,9 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 
 	sess.handleAgentRequest(&msg)
 
-	if msg.Pty {
+	if sess.mwSess != nil {
+		err = sess.StartMiddleware()
+	} else if msg.Pty {
 		err = sess.StartPty()
 	} else {
 		err = sess.StartCmd()
@@ -736,7 +779,7 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 		return
 	}
 
-	if msg.Shell {
+	if sess.mwSess == nil && msg.Shell {
 		sess.showMotd(stream)
 	}
 
@@ -760,16 +803,23 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 }
 
 func newSessionContext(server *sshUdpServer, msg *startMessage) (*sessionContext, error) {
-	cmd, err := getSessionStartCmd(msg)
-	if err != nil {
-		return nil, fmt.Errorf("build start command failed: %v", err)
+	var cmd *exec.Cmd
+	var mwSess *middlewareSession
+	if sessionHandler != nil {
+		mwSess = newMiddlewareSession(msg)
+	} else {
+		var err error
+		cmd, err = getSessionStartCmd(msg)
+		if err != nil {
+			return nil, fmt.Errorf("build start command failed: %v", err)
+		}
 	}
 
 	sessionMutex.Lock()
 	defer sessionMutex.Unlock()
 
-	if sess, ok := sessionMap[msg.ID]; ok {
-		return nil, fmt.Errorf("session id %d %v existed", msg.ID, sess.cmd.Args)
+	if _, ok := sessionMap[msg.ID]; ok {
+		return nil, fmt.Errorf("session id %d existed", msg.ID)
 	}
 
 	if msg.ID > maxSessionID.Load() {
@@ -779,6 +829,7 @@ func newSessionContext(server *sshUdpServer, msg *startMessage) (*sessionContext
 	sess := &sessionContext{
 		id:            msg.ID,
 		cmd:           cmd,
+		mwSess:        mwSess,
 		cols:          msg.Cols,
 		rows:          msg.Rows,
 		clientChecker: newReplaceableTimeoutChecker(server.clientChecker),
@@ -1033,6 +1084,11 @@ func (c *sessionContext) handleX11Request(msg *startMessage) {
 		return
 	}
 
+	if !enableForwardings {
+		warning("X11 forwarding is not enabled on the server")
+		return
+	}
+
 	if v := strings.ToLower(getSshdConfig("X11Forwarding")); v != "yes" {
 		warning("X11Forwarding is not permitted on the server. Check [X11Forwarding] in [%s] on the server.", sshdConfigPath)
 		return
@@ -1084,7 +1140,12 @@ func (c *sessionContext) handleX11Request(msg *startMessage) {
 		go c.handleChannelAccept(listener, msg.X11.ChannelType)
 	}
 
-	c.cmd.Env = append(c.cmd.Env, fmt.Sprintf("DISPLAY=%s", display))
+	env := fmt.Sprintf("DISPLAY=%s", display)
+	if c.mwSess != nil {
+		c.mwSess.envs = append(c.mwSess.envs, env)
+	} else {
+		c.cmd.Env = append(c.cmd.Env, env)
+	}
 }
 
 func getHostnameForX11(useLocalhost bool) string {
@@ -1202,6 +1263,11 @@ func (c *sessionContext) handleAgentRequest(msg *startMessage) {
 		return
 	}
 
+	if !enableForwardings {
+		warning("agent forwarding is not enabled on the server")
+		return
+	}
+
 	if v := strings.ToLower(getSshdConfig("AllowAgentForwarding")); v == "no" {
 		warning("AgentForwarding is not permitted on the server. Check [AllowAgentForwarding] in [%s] on the server.", sshdConfigPath)
 		return
@@ -1219,7 +1285,12 @@ func (c *sessionContext) handleAgentRequest(msg *startMessage) {
 
 	go c.handleChannelAccept(listener, msg.Agent.ChannelType)
 
-	c.cmd.Env = append(c.cmd.Env, fmt.Sprintf("SSH_AUTH_SOCK=%s", agentPath))
+	env := fmt.Sprintf("SSH_AUTH_SOCK=%s", agentPath)
+	if c.mwSess != nil {
+		c.mwSess.envs = append(c.mwSess.envs, env)
+	} else {
+		c.cmd.Env = append(c.cmd.Env, env)
+	}
 }
 
 func (c *sessionContext) handleChannelAccept(listener net.Listener, channelType string) {

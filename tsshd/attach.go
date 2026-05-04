@@ -375,7 +375,7 @@ func (s *sshUdpServer) attachSession(stream Stream, msg *startMessage) (*session
 	// are ready when the client checker reports the client reconnected.
 	sess.clientChecker.swap(s.clientChecker)
 
-	if sess.pty != nil {
+	if sess.mwSess != nil && sess.mwSess.pty || sess.pty != nil {
 		if msg.Cols > 0 && msg.Rows > 0 {
 			sess.cols, sess.rows = msg.Cols, msg.Rows
 		}

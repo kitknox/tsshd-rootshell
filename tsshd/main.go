@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -41,12 +42,14 @@ const kDefaultConnectTimeout = 10 * time.Second
 
 const (
 	kExitCodeNormal       = 0
+	kExitCodeAlreadyRun   = 90
 	kExitCodeBackground   = 91
 	kExitCodeOutputFail   = 92
 	kExitCodeInitServer   = 93
 	kExitCodeConnTimeout  = 94
 	kExitCodeAliveTimeout = 95
 	kExitCodeSignalKill   = 96
+	kExitCodeApplyOptions = 97
 )
 
 var exitChan = make(chan int, 1)
@@ -144,17 +147,26 @@ func background() (bool, io.ReadCloser, error) {
 	if v := os.Getenv(kEnvTsshdBackground); v == "TRUE" {
 		return false, nil, nil
 	}
-	cmd := exec.Command(os.Args[0], os.Args[1:]...)
+
+	exePath, err := os.Executable()
+	if err != nil {
+		exePath = os.Args[0]
+	}
+
+	cmd := exec.Command(exePath, os.Args[1:]...)
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), kEnvTsshdBackground+"=TRUE")
 	cmd.SysProcAttr = getSysProcAttr()
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return true, nil, err
 	}
+
 	if err := cmd.Start(); err != nil {
 		return true, nil, err
 	}
+
 	return true, stdout, nil
 }
 
@@ -178,32 +190,48 @@ func addOnExitFunc(fn func()) {
 	onExitFuncs = append(onExitFuncs, fn)
 }
 
-// TsshdMain is the main function of `tsshd` binary.
-func TsshdMain() int {
+var mainOnce atomic.Bool
+
+// RunMain is the main entry point for the tsshd daemon process.
+//
+// The code before RunMain is executed in the original parent process,
+// and again in the forked child process during daemon initialization.
+//
+// After forking, the parent process will exit,
+// and only the child process continues running.
+func RunMain(opts ...Option) (int, error) {
+	if !mainOnce.CompareAndSwap(false, true) {
+		return kExitCodeAlreadyRun, fmt.Errorf("tsshd server already running")
+	}
+
+	for _, opt := range opts {
+		if err := opt(); err != nil {
+			return kExitCodeApplyOptions, fmt.Errorf("apply option failed: %v", err)
+		}
+	}
+
 	args := parseTsshdArgs()
 	if args.Help {
-		return printHelp()
+		return printHelp(), nil
 	}
 	if args.VerShort {
-		return printVersionShort()
+		return printVersionShort(), nil
 	}
 	if args.VerDetailed {
-		return printVersionDetailed()
+		return printVersionDetailed(), nil
 	}
 
 	parent, stdout, err := background()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "run in background failed: %v\n", err)
-		return kExitCodeBackground
+		return kExitCodeBackground, fmt.Errorf("run in background failed: %v", err)
 	}
 
 	if parent {
 		defer func() { _ = stdout.Close() }()
 		if _, err := io.Copy(os.Stdout, stdout); err != nil {
-			fmt.Fprintf(os.Stderr, "copy stdout failed: %v\n", err)
-			return kExitCodeOutputFail
+			return kExitCodeOutputFail, fmt.Errorf("forward stdout failed: %v", err)
 		}
-		return 0
+		return 0, nil
 	}
 
 	// cleanup on exit
@@ -214,16 +242,15 @@ func TsshdMain() int {
 		args.ConnectTimeout = kDefaultConnectTimeout
 	}
 
-	// init debug
+	// init logging and sshd_config
+	enableWarningLogging = true
+
 	if args.Debug {
 		initDebugLogging()
 	}
 
-	// init sshd_config
 	initSshdConfig()
 
-	// init warning
-	enableWarningLogging = true
 	if !enableDebugLogging {
 		if v := strings.ToLower(getSshdConfig("LogLevel")); v == "quiet" || v == "fatal" {
 			enableWarningLogging = false
@@ -236,10 +263,10 @@ func TsshdMain() int {
 		debug("init server failed: %v", err)
 		fmt.Println(err)
 		_ = os.Stdout.Close()
-		return kExitCodeInitServer
+		return kExitCodeInitServer, nil // Error has been forwarded to stdout for parent handling
 	}
 
-	fmt.Printf("\a%s\r\n", info)
+	fmt.Printf("\a%s\n", info)
 
 	addOnExitFunc(func() {
 		if server := activeSshUdpServer.Load(); server != nil {
@@ -261,7 +288,7 @@ func TsshdMain() int {
 	go handleExitSignals()
 
 	// wait for exit
-	return <-exitChan
+	return <-exitChan, nil
 }
 
 func monitorServerLiveness(args *tsshdArgs) {

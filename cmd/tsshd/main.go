@@ -25,11 +25,16 @@ SOFTWARE.
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/trzsz/tsshd/tsshd"
 )
 
 func main() {
-	os.Exit(tsshd.TsshdMain())
+	code, err := tsshd.RunMain(tsshd.WithForwardings())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+	}
+	os.Exit(code)
 }

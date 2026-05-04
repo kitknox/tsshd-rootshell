@@ -383,13 +383,14 @@ func (p *clientProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 			}
 
 			if p.kcpCrypto != nil {
-				n, err = p.kcpCrypto.openPacket(buf[:n])
+				nn, err := p.kcpCrypto.openPacket(buf[:n])
 				if err != nil {
 					if enableDebugLogging {
 						p.client.debug("open packet failed: len=%d, auth=%v", n, len(aesDecrypt(p.cipherBlock, buf[:n])) == 16)
 					}
 					continue
 				}
+				n = nn
 			}
 
 			p.serverChecker.updateNow()

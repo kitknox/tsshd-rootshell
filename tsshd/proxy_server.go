@@ -62,6 +62,7 @@ type clientState struct {
 	clientMutex  sync.Mutex
 	clientCond   *sync.Cond
 	pktCache     packetCache
+	cachingPkt   atomic.Bool
 	kcpCrypto    *rotatingCrypto
 }
 
@@ -482,7 +483,7 @@ func (c *udpFrontendConn) writeTo(buf []byte, client *clientState) error {
 		// In attachable mode, waiting for the old client to reconnect may block new clients from sending packets.
 		// In all modes, waiting could block subsequent packets and prevent caching of packets during disconnections.
 		// In scenarios with frequent reconnections, a lack of cached packets may fail to reactivate the KCP/QUIC session.
-		return fmt.Errorf("client addr is nil")
+		return fmt.Errorf("client [%x] addr is nil", client.proxyAddr.clientID)
 	}
 
 	_, err := c.waitConn().WriteTo(buf, addr)
@@ -705,7 +706,6 @@ type serverProxy struct {
 	clientID     uint64
 	soleClient   *clientState
 	clientMutex  sync.RWMutex
-	cachingPkt   atomic.Bool
 	// This map is intentionally not cleaned up to prevent replay attacks.
 	// Only optimize if memory usage becomes a real issue, and even then,
 	// serialNumber must be retained for replay protection.
@@ -815,14 +815,14 @@ func (p *serverProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 		n, client = p.frontendConn.readFrom(buf)
 
 		if client.kcpCrypto != nil {
-			var err error
-			n, err = client.kcpCrypto.openPacket(buf[:n])
+			nn, err := client.kcpCrypto.openPacket(buf[:n])
 			if err != nil {
 				if enableDebugLogging {
 					debug("open packet failed: len=%d, auth=%v", n, len(aesDecrypt(p.cipherBlock, buf[:n])) == 16)
 				}
 				continue
 			}
+			n = nn
 		}
 
 		break
@@ -852,13 +852,13 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 
 	if server := client.server.Load(); server != nil {
 		if server.clientChecker.isTimeout() {
-			if enableDebugLogging && p.cachingPkt.CompareAndSwap(false, true) {
-				debug("switching to packet caching mode")
+			if enableDebugLogging && client.cachingPkt.CompareAndSwap(false, true) {
+				debug("client [%x] switching to packet caching mode", client.proxyAddr.clientID)
 			}
 			client.pktCache.addPacket(buf)
 			return n, nil
-		} else if enableDebugLogging && p.cachingPkt.CompareAndSwap(true, false) {
-			debug("switching to direct transmission mode")
+		} else if enableDebugLogging && client.cachingPkt.CompareAndSwap(true, false) {
+			debug("client [%x] switching to direct transmission mode", client.proxyAddr.clientID)
 		}
 
 		if server.shouldSample.Load() && server.shouldSample.CompareAndSwap(true, false) {

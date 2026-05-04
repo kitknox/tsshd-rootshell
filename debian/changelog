@@ -1,3 +1,9 @@
+tsshd (0.1.7) trusty; urgency=medium
+
+  * tsshd v0.1.7
+
+ -- Lonny Wong <lonnywong@qq.com>  Sun, 03 May 2026 08:21:15 +0800
+
 tsshd (0.1.6) trusty; urgency=medium
 
   * tsshd v0.1.6

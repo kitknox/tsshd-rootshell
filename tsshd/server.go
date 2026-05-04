@@ -213,6 +213,26 @@ func (s *sshUdpServer) Close() {
 	s.client.server.Store(nil)
 }
 
+// handlerFunc defines the signature for stream handlers.
+type handlerFunc func(*sshUdpServer, Stream)
+
+// baseHandlers contains handlers for core stream types.
+var baseHandlers = map[string]handlerFunc{
+	"bus":     (*sshUdpServer).handleBusEvent,
+	"session": (*sshUdpServer).handleSessionEvent,
+	"stderr":  (*sshUdpServer).handleStderrEvent,
+}
+
+// forwardHandlers contains handlers for port forwarding related streams.
+var forwardHandlers = map[string]handlerFunc{
+	"dial":       (*sshUdpServer).handleDialEvent,
+	"listen":     (*sshUdpServer).handleListenEvent,
+	"accept":     (*sshUdpServer).handleAcceptEvent,
+	"dial-udp":   (*sshUdpServer).handleDialUdpEvent,
+	"listen-udp": (*sshUdpServer).handleListenUdpEvent,
+	"accept-udp": (*sshUdpServer).handleAcceptUdpEvent,
+}
+
 func (s *sshUdpServer) handleStream(stream Stream) {
 	// register stream with closed check
 	s.streamMutex.Lock()
@@ -265,27 +285,16 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 	}
 
 	// dispatch handler
-	var handler func(Stream)
-	switch command {
-	case "bus":
-		handler = s.handleBusEvent
-	case "session":
-		handler = s.handleSessionEvent
-	case "stderr":
-		handler = s.handleStderrEvent
-	case "dial":
-		handler = s.handleDialEvent
-	case "listen":
-		handler = s.handleListenEvent
-	case "accept":
-		handler = s.handleAcceptEvent
-	case "dial-udp":
-		handler = s.handleDialUdpEvent
-	case "listen-udp":
-		handler = s.handleListenUdpEvent
-	case "accept-udp":
-		handler = s.handleAcceptUdpEvent
-	default:
+	var handler handlerFunc
+	if h, ok := baseHandlers[command]; ok {
+		handler = h
+	} else if h, ok := forwardHandlers[command]; ok {
+		if !enableForwardings {
+			sendError(stream, fmt.Errorf("port forwarding is not enabled: %s", command))
+			return
+		}
+		handler = h
+	} else {
 		sendError(stream, fmt.Errorf("unknown stream command: %s", command))
 		return
 	}
@@ -296,7 +305,7 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 		return
 	}
 
-	handler(stream)
+	handler(s, stream)
 }
 
 func (s *sshUdpServer) closeActiveStreams() {

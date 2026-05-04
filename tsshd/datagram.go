@@ -420,12 +420,12 @@ func (s *sshUdpServer) handleDialUdpEvent(stream Stream) {
 
 type unixgramConn struct {
 	io.ReadWriteCloser
-	localAddr string
+	unlinker func()
 }
 
 func (c *unixgramConn) Close() error {
 	err := c.ReadWriteCloser.Close()
-	_ = os.Remove(c.localAddr)
+	c.unlinker()
 	return err
 }
 
@@ -451,7 +451,7 @@ func dialUDP(msg *dialUdpMessage) (io.ReadWriteCloser, error) {
 			}
 			return nil, err
 		}
-		return &unixgramConn{conn, localAddr}, nil
+		return &unixgramConn{conn, newFileUnlinker(localAddr, nil)}, nil
 	}
 
 	var err error
@@ -476,11 +476,11 @@ func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser, msg *dialUdpMessage)
 		_ = pconn.Close()
 	}()
 
-	done1 := make(chan struct{})
-	done2 := make(chan struct{})
+	clientDone := make(chan struct{})
+	serverDone := make(chan struct{})
 
 	go func() {
-		defer close(done1)
+		defer close(clientDone)
 		var warnOnce sync.Once
 		_ = pconn.Consume(func(buf []byte) error {
 			if _, err := conn.Write(buf); err != nil {
@@ -497,14 +497,21 @@ func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser, msg *dialUdpMessage)
 	}()
 
 	go func() {
-		defer close(done2)
+		defer close(serverDone)
 		buffer := make([]byte, 0xffff)
 		for {
 			n, err := conn.Read(buffer)
 			if err != nil {
 				if isClosedError(err) {
-					debug("udp forwarding read from [%s] [%s] closed: %v", msg.Net, msg.Addr, err)
-					return
+					select {
+					case <-clientDone:
+						// The client actively closed the connection. Return silently to reduce log noise.
+						// The client can handle its own logging for connection closures if needed.
+						return
+					default:
+						debug("udp forwarding read from [%s] [%s] closed: %v", msg.Net, msg.Addr, err)
+						return
+					}
 				}
 				warning("udp forwarding read from [%s] [%s] failed: %v", msg.Net, msg.Addr, err)
 				return
@@ -521,8 +528,8 @@ func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser, msg *dialUdpMessage)
 	}()
 
 	select {
-	case <-done1:
-	case <-done2:
+	case <-clientDone:
+	case <-serverDone:
 	}
 }
 
@@ -681,19 +688,29 @@ func (s *sshUdpServer) handleListenUdpEvent(stream Stream) {
 		return
 	}
 
+	if msg.Net == "unixgram" {
+		if err := unlinkStaleUnixSocket(msg.Addr); err != nil {
+			sendError(stream, err)
+			return
+		}
+	}
+
 	listenerConn, err := net.ListenPacket(msg.Net, msg.Addr)
 	if err != nil {
 		sendError(stream, err)
 		return
 	}
 
-	addOnExitFunc(func() {
-		_ = listenerConn.Close()
-		if msg.Net == "unixgram" {
-			_ = os.Remove(msg.Addr)
+	if msg.Net == "unixgram" {
+		mode := os.FileMode(0666) &^ os.FileMode(streamLocalBindMask())
+		if err := os.Chmod(msg.Addr, mode); err != nil {
+			warning("chmod unix socket [%s] to %#o failed: %v", msg.Addr, mode, err)
 		}
-	})
-	defer func() { _ = listenerConn.Close() }()
+		defer newFileUnlinker(msg.Addr, listenerConn)()
+	} else {
+		defer func() { _ = listenerConn.Close() }()
+		addOnExitFunc(func() { _ = listenerConn.Close() })
+	}
 
 	if err := sendSuccess(stream); err != nil { // ack ok
 		warning("udp listener [%s] [%s] ack ok failed: %v", msg.Net, msg.Addr, err)

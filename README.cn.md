@@ -2,10 +2,12 @@
 
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg?style=flat)](https://choosealicense.com/licenses/mit/)
 [![GitHub Release](https://img.shields.io/github/v/release/trzsz/tsshd)](https://github.com/trzsz/tsshd/releases)
+[![WebSite](https://img.shields.io/badge/WebSite-https%3A%2F%2Ftrzsz.github.io%2Ftsshd-blue?style=flat)](https://trzsz.github.io/tsshd)
+[![中文文档](https://img.shields.io/badge/%E4%B8%AD%E6%96%87%E6%96%87%E6%A1%A3-https%3A%2F%2Ftrzsz.github.io%2Fcn%2Ftsshd-blue?style=flat)](https://trzsz.github.io/cn/tsshd)
 
-tsshd 是一个基于 UDP 的 SSH 服务器，专为不稳定网络环境设计，支持在网络切换或 IP 变化时无缝漫游，并能在高延迟链路（如蜂窝网络和不稳定的 Wi-Fi）上稳定工作。
+**tsshd** 是一个基于 UDP 的 SSH 服务器，专为不稳定网络环境设计，支持在网络切换或 IP 变化时无缝漫游，并能在高延迟链路（如蜂窝网络和不稳定的 Wi-Fi）上稳定工作。
 
-tsshd 旨在与 OpenSSH 完全兼容，并提供额外能力：
+**tsshd** 旨在与 OpenSSH 完全兼容，并提供额外能力：
 
 - 客户端休眠、唤醒或临时网络中断时，SSH 会话仍可保持。
 - 在网络切换或 IP 变化时无缝漫游，不会中断 SSH 会话。
@@ -13,7 +15,7 @@ tsshd 旨在与 OpenSSH 完全兼容，并提供额外能力：
 
 ## 功能对比
 
-tsshd 的灵感来源于 [mosh](https://github.com/mobile-shell/mosh)，`tsshd` 类似于 `mosh-server`，而 `tssh --udp` 类似于 `mosh`。
+**tsshd** 的灵感来源于 [mosh](https://github.com/mobile-shell/mosh)，`tsshd` 类似于 `mosh-server`，而 `tssh --udp` 类似于 `mosh`。
 
 | Feature              |                     mosh ( mosh-server )                      |              tssh ( tsshd )               |
 | -------------------- | :-----------------------------------------------------------: | :---------------------------------------: |
@@ -86,7 +88,18 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
   </details>
 
-- Linux 可用 yum 安装
+- Fedora / CentOS / RHEL 可用 dnf 安装
+
+  <details><summary><code>sudo dnf install tsshd</code></summary>
+
+  ```sh
+  sudo dnf copr enable @trzsz/tsshd
+  sudo dnf install tsshd
+  ```
+
+  </details>
+
+- 传统版本 CentOS / RHEL 可用 yum 安装
 
   <details><summary><code>sudo yum install tsshd</code></summary>
 
@@ -320,6 +333,93 @@ Host xxx
   ```
 
 - `ForwardUdpTimeout`: 设置 UDP 转发会话的空闲超时时间。在指定时间内无数据收发时将自动清理对应的转发会话以释放资源。默认 5 分钟。
+
+## 开发者指南：构建自定义 SSH 服务
+
+**tsshd** 不仅仅是一个二进制程序，它还是一个强大的框架，允许你构建具有 **无缝漫游** 和 **低延迟** 能力的自定义 SSH 应用。
+
+### A. 快速开始：自定义业务逻辑
+
+你可以通过 `tsshd` 提供的中间件机制，轻松地在 SSH 会话中注入自己的交互逻辑。
+
+```go
+func main() {
+    // 使用 tsshd.RunMain 作为入口，并注入自定义中间件
+    code, err := tsshd.RunMain(
+        tsshd.WithMiddleware(func(next tsshd.Handler) tsshd.Handler {
+            return func(sess tsshd.Session) {
+                term := term.NewTerminal(sess, "输入你的名字: ")
+                name, _ := term.ReadLine()
+                fmt.Fprintf(sess, "你好, %s！这是一个支持漫游的自定义 SSH 服务。\r\n", name)
+            }
+        }),
+    )
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "%v\n", err)
+    }
+    os.Exit(code)
+}
+```
+
+**运行原理：**
+
+1.  **OpenSSH 引导**：当客户端使用 `tssh --udp` 连接时，它首先通过标准 SSH 协议登录。
+2.  **拉起进程**：OpenSSH 会在服务端拉起你编写的这个二进制程序。
+3.  **协议切换**：该程序启动后监听随机 UDP 端口，并将密钥返回给客户端，随后客户端切换到 QUIC/KCP 协议与该程序直接通信。
+
+> **注意**：如果你的程序不在 `PATH` 中，请在客户端配置 `TsshdPath` 或使用 `--tsshd-path` 指定路径。
+
+### B. 高级进阶：使用 Wish 构建集成化服务器
+
+如果你不想依赖系统自带的 OpenSSH 来拉起进程，或者想构建一个纯粹的、单文件的自定义 SSH 服务器，可以将 [Wish](https://github.com/charmbracelet/wish)（基于 [gliderlabs/ssh](https://github.com/gliderlabs/ssh)）与 `tsshd` 结合。
+
+这种模式下，你的程序可以同时扮演两个角色：
+
+- **常规 SSH 服务器 (TCP)**：监听 22 或自定义端口，处理初始登录。
+- **tsshd 服务器 (UDP)**：处理漫游、重连和低延迟传输。
+
+#### 核心设计思路：适配器模式
+
+为了让业务逻辑（如终端交互）在 Wish 和 `tsshd` 之间复用，你可以通过定义统一的 `Session` 接口来屏蔽底层差异：
+
+```go
+// 统一 Session 接口，让业务逻辑在 Wish(TCP) 和 tsshd(UDP) 之间通用
+type Session = tsshd.Session
+
+func handleBusiness(sess Session) {
+    fmt.Fprintf(sess, "当前会话类型: %T\r\n", sess)
+    // 编写你的业务逻辑...
+}
+```
+
+#### 会话接管 (Process Handoff)
+
+当 Wish 接收到客户端发出的启动 `tsshd` 指令时，你可以通过 `exec.Command` 重新执行当前的二进制文件（带上 `tsshd` 参数），实现从“标准 SSH 握手”到“UDP 低延迟传输”的无缝切换：
+
+1.  **检测指令**：在 Wish 中间件中捕获客户端执行 `tsshd` 的请求。
+2.  **二次启动**：在服务端本地启动一个子进程（当前程序的 tsshd 模式）。
+3.  **环境继承**：将当前的连接信息（如 `SSH_CONNECTION`）传递给子进程。
+
+### C. 为什么选择这种架构？
+
+- **开发效率**：利用 Go 语言生态，像写 Web 中间件一样编写 SSH 服务。
+- **混合部署**：将客户端 (`tssh`) 和服务端 (`tsshd`) 逻辑打包进同一个二进制文件，简化分发。
+- **极致体验**：用户既能享受传统 SSH 的安全性，又能获得在高延迟、网络切换环境下的丝滑体验（断线自动重连）。
+
+### D. 示例代码 (Examples)
+
+为了帮助您快速上手，我们在 [`examples/`](https://github.com/trzsz/tsshd/tree/main/examples) 目录下提供了完整可运行的示例代码。您可以将这些示例作为构建自定义 SSH 服务的模板。
+
+- **[examples/hello](https://github.com/trzsz/tsshd/tree/main/examples/hello)**
+  最基础的实现。它演示了如何使用 `tsshd.WithMiddleware` 拦截 SSH 会话，打印欢迎信息，并使用 `term` 包读取用户输入。非常适合用于构建交互式 CLI 工具。
+
+- **[examples/sshd](https://github.com/trzsz/tsshd/tree/main/examples/sshd)**
+  一个更全面的示例，展示了如何处理实际的命令执行。它演示了如何正确路由 PTY（交互式）和 Direct（批处理）执行流，处理终端窗口大小调整，以及将标准 I/O 直接流式传输到本地子进程。
+
+- **[examples/wish](https://github.com/trzsz/tsshd/tree/main/examples/wish)**
+  上述**混合架构**的完整展示。它实现了适配器模式以统一 `Session` 接口，允许相同的业务逻辑在传统的 TCP SSH 服务器（Wish）和低延迟的 UDP `tsshd` 服务器之间无缝运行，并包含完整的进程切换（Handoff）机制。
+
+> **提示**：您可以在本地运行这些示例，并使用 `tssh` 客户端进行测试，以亲身体验低延迟和漫游功能！
 
 ## 联系方式
 

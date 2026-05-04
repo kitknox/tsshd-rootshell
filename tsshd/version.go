@@ -33,7 +33,7 @@ import (
 	"strings"
 )
 
-const kTsshdVersion = "0.1.6"
+const kTsshdVersion = "0.1.7"
 
 // buildTag stores the version tag injected at build time via -ldflags.
 var buildTag = ""

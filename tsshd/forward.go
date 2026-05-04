@@ -28,9 +28,49 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
+
+// streamLocalBindMask returns the StreamLocalBindMask from sshd_config.
+// OpenSSH's default is 0177.
+func streamLocalBindMask() int {
+	v := getSshdConfig("StreamLocalBindMask")
+	if v == "" {
+		return 0177
+	}
+	mask, err := strconv.ParseInt(v, 8, 32)
+	if err != nil || mask < 0 || mask > 0777 {
+		warning("invalid StreamLocalBindMask [%s] in [%s], using default 0177", v, sshdConfigPath)
+		return 0177
+	}
+	return int(mask)
+}
+
+// unlinkStaleUnixSocket honors StreamLocalBindUnlink from sshd_config. If the
+// path exists and is a unix socket, it is removed. Non-socket files are
+// refused. Missing paths are a no-op.
+func unlinkStaleUnixSocket(path string) error {
+	if strings.ToLower(getSshdConfig("StreamLocalBindUnlink")) != "yes" {
+		return nil
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("refusing to unlink non-socket path: %s", path)
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	debug("unlinked existing unix socket [%s] per StreamLocalBindUnlink", path)
+	return nil
+}
 
 func sendProhibited(stream Stream, option string) {
 	sendErrorCode(stream, ErrProhibited, fmt.Sprintf("Check [%s] in [%s] on the server.", option, sshdConfigPath))
@@ -115,19 +155,29 @@ func (s *sshUdpServer) handleListenEvent(stream Stream) {
 		return
 	}
 
+	if msg.Net == "unix" {
+		if err := unlinkStaleUnixSocket(msg.Addr); err != nil {
+			sendError(stream, err)
+			return
+		}
+	}
+
 	listener, err := net.Listen(msg.Net, msg.Addr)
 	if err != nil {
 		sendError(stream, err)
 		return
 	}
 
-	addOnExitFunc(func() {
-		_ = listener.Close()
-		if msg.Net == "unix" {
-			_ = os.Remove(msg.Addr)
+	if msg.Net == "unix" {
+		mode := os.FileMode(0666) &^ os.FileMode(streamLocalBindMask())
+		if err := os.Chmod(msg.Addr, mode); err != nil {
+			warning("chmod unix socket [%s] to %#o failed: %v", msg.Addr, mode, err)
 		}
-	})
-	defer func() { _ = listener.Close() }()
+		defer newFileUnlinker(msg.Addr, listener)()
+	} else {
+		defer func() { _ = listener.Close() }()
+		addOnExitFunc(func() { _ = listener.Close() })
+	}
 
 	if err := sendSuccess(stream); err != nil { // ack ok
 		warning("listener [%s] [%s] ack ok failed: %v", msg.Net, msg.Addr, err)

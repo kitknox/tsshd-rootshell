@@ -2,11 +2,12 @@
 
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg?style=flat)](https://choosealicense.com/licenses/mit/)
 [![GitHub Release](https://img.shields.io/github/v/release/trzsz/tsshd)](https://github.com/trzsz/tsshd/releases)
-[![中文文档](https://img.shields.io/badge/%E4%B8%AD%E6%96%87-%E6%96%87%E6%A1%A3-blue?style=flat)](https://github.com/trzsz/tsshd/blob/main/README.cn.md)
+[![WebSite](https://img.shields.io/badge/WebSite-https%3A%2F%2Ftrzsz.github.io%2Ftsshd-blue?style=flat)](https://trzsz.github.io/tsshd)
+[![中文文档](https://img.shields.io/badge/%E4%B8%AD%E6%96%87%E6%96%87%E6%A1%A3-https%3A%2F%2Ftrzsz.github.io%2Fcn%2Ftsshd-blue?style=flat)](https://trzsz.github.io/cn/tsshd)
 
-tsshd is a UDP-based SSH server built for unreliable networks. It supports seamless roaming across networks and IP changes, and works well on high-latency links such as cellular connections and unstable Wi-Fi.
+**tsshd** is a UDP-based SSH server built for unreliable networks. It supports seamless roaming across networks and IP changes, and works well on high-latency links such as cellular connections and unstable Wi-Fi.
 
-tsshd aims to be fully compatible with OpenSSH while providing additional capabilities:
+**tsshd** aims to be fully compatible with OpenSSH while providing additional capabilities:
 
 - Survives sleep, wake, and temporary network loss.
 - Roams seamlessly across networks and IP changes.
@@ -14,7 +15,7 @@ tsshd aims to be fully compatible with OpenSSH while providing additional capabi
 
 ### Comparison
 
-tsshd was inspired by [mosh](https://github.com/mobile-shell/mosh), and the `tsshd` works like `mosh-server`, while the `tssh --udp` works like `mosh`.
+**tsshd** was inspired by [mosh](https://github.com/mobile-shell/mosh), and the `tsshd` works like `mosh-server`, while the `tssh --udp` works like `mosh`.
 
 | Feature                   |                     mosh ( mosh-server )                      |              tssh ( tsshd )               |
 | ------------------------- | :-----------------------------------------------------------: | :---------------------------------------: |
@@ -87,7 +88,18 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
 
   </details>
 
-- Install with yum on Linux
+- Install with dnf on Fedora / CentOS / RHEL
+
+  <details><summary><code>sudo dnf install tsshd</code></summary>
+
+  ```sh
+  sudo dnf copr enable @trzsz/tsshd
+  sudo dnf install tsshd
+  ```
+
+  </details>
+
+- Install with yum on Legacy CentOS / RHEL
 
   <details><summary><code>sudo yum install tsshd</code></summary>
 
@@ -321,6 +333,93 @@ When using tssh as the client, UDP port forwarding is supported.
   ```
 
 - `ForwardUdpTimeout`: Sets the idle timeout for UDP forwarding sessions; the corresponding forwarding session will be cleared automatically if no data is sent or received within this period to free resources. Default is 5 minutes.
+
+### Developer Guide: Building Custom SSH Services
+
+**tsshd** is more than just a binary program; it is a powerful framework that allows you to build custom SSH applications with **seamless roaming** and **low-latency** capabilities.
+
+#### A. Quick Start: Custom Business Logic
+
+You can easily inject your own interaction logic into an SSH session using the middleware mechanism provided by `tsshd`.
+
+```go
+func main() {
+    // Use tsshd.RunMain as the entry point and inject custom middleware
+    code, err := tsshd.RunMain(
+        tsshd.WithMiddleware(func(next tsshd.Handler) tsshd.Handler {
+            return func(sess tsshd.Session) {
+                term := term.NewTerminal(sess, "Enter your name: ")
+                name, _ := term.ReadLine()
+                fmt.Fprintf(sess, "Hello, %s! This is a custom SSH service with roaming support.\r\n", name)
+            }
+        }),
+    )
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "%v\n", err)
+    }
+    os.Exit(code)
+}
+```
+
+**How it Works:**
+
+1.  **OpenSSH Bootstrapping**: When a client connects using `tssh --udp`, it first logs in via the standard SSH protocol.
+2.  **Process Spawning**: OpenSSH spawns your custom binary on the server side.
+3.  **Protocol Switch**: The program starts and listens on a random UDP port, sends the session keys back to the client, and then the client switches to the QUIC/KCP protocol to communicate directly with the program.
+
+> **Note**: If your binary is not in the system `PATH`, you must specify the path on the client side using the `TsshdPath` config or the `--tsshd-path` CLI option.
+
+#### B. Advanced: Building Integrated Servers with Wish
+
+If you don't want to rely on the system's OpenSSH to spawn processes, or if you want to build a pure, single-binary custom SSH server, you can combine [Wish](https://github.com/charmbracelet/wish) (based on [gliderlabs/ssh](https://github.com/gliderlabs/ssh)) with `tsshd`.
+
+In this mode, your program can play two roles simultaneously:
+
+- **Regular SSH Server (TCP)**: Listens on port 22 or a custom port to handle the initial login.
+- **tsshd Server (UDP)**: Handles roaming, reconnection, and low-latency transmission.
+
+##### Core Design Concept: Adapter Pattern
+
+To reuse business logic (such as terminal interaction) across both Wish and `tsshd`, you can define a unified `Session` interface to abstract away the underlying differences:
+
+```go
+// Unified Session interface to make business logic shared between Wish (TCP) and tsshd (UDP)
+type Session = tsshd.Session
+
+func handleBusiness(sess Session) {
+    fmt.Fprintf(sess, "Current session type: %T\r\n", sess)
+    // Write your business logic here...
+}
+```
+
+##### Session Handoff (Process Handoff)
+
+When Wish receives a request from the client to start `tsshd`, you can use `exec.Command` to re-execute the current binary (with `tsshd` arguments) to achieve a seamless switch from a "standard SSH handshake" to "UDP low-latency transmission":
+
+1.  **Instruction Detection**: Capture the client's request to execute `tsshd` within the Wish middleware.
+2.  **Secondary Launch**: Start a sub-process locally on the server (running the current program in `tsshd` mode).
+3.  **Environment Inheritance**: Pass current connection info (like `SSH_CONNECTION`) to the sub-process.
+
+#### C. Why Choose This Architecture?
+
+- **Development Efficiency**: Leverage the Go ecosystem to write SSH services as easily as writing Web middleware.
+- **Hybrid Deployment**: Package both client (`tssh`) and server (`tsshd`) logic into a single binary, simplifying distribution.
+- **Superior Experience**: Users enjoy the security of traditional SSH alongside a smooth experience in high-latency or unstable network environments, including automatic reconnection and seamless roaming.
+
+#### D. Examples
+
+To help you get started quickly, we provide fully working sample code in the [`examples/`](https://github.com/trzsz/tsshd/tree/main/examples) directory. You can use these as templates for your own custom SSH services.
+
+- **[examples/hello](https://github.com/trzsz/tsshd/tree/main/examples/hello)**
+  The most basic implementation. It demonstrates how to use `tsshd.WithMiddleware` to intercept an SSH session, print a greeting, and read user input using the `term` package. Perfect for building interactive CLI tools.
+
+- **[examples/sshd](https://github.com/trzsz/tsshd/tree/main/examples/sshd)**
+  A more comprehensive example showing how to handle actual command execution. It demonstrates how to properly route PTY (interactive) and Direct (batch) execution flows, handle terminal window resizing, and stream standard I/O directly to local sub-processes.
+
+- **[examples/wish](https://github.com/trzsz/tsshd/tree/main/examples/wish)**
+  A complete showcase of the **Hybrid Architecture** mentioned above. It implements the adapter pattern to unify the `Session` interface, allowing the same business logic to run seamlessly across a traditional TCP SSH server (Wish) and the low-latency UDP `tsshd` server, complete with the process handoff mechanism.
+
+> **Tip**: You can run these examples locally and test them using the `tssh` client to experience the low-latency and roaming features firsthand!
 
 ### Contact
 
