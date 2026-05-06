@@ -44,13 +44,27 @@ func (s *sshUdpServer) sendBusMessage(command string, msg any) error {
 	return sendCommandAndMessage(s.busStream, command, msg)
 }
 
-func (s *sshUdpServer) initBusStream(stream Stream) error {
+func (s *sshUdpServer) initBusAndServer(stream Stream, msg *busMessage) error {
 	s.busMutex.Lock()
 	defer s.busMutex.Unlock()
 
 	// only one bus
 	if s.busStream != nil {
 		return fmt.Errorf("bus has been initialized")
+	}
+
+	s.initClientChecker(msg.HeartbeatTimeout)
+	s.clientAliveTime.addMilli(time.Now().UnixMilli())
+	s.aliveTimeout, s.intervalTime = msg.AliveTimeout, msg.IntervalTime
+
+	if err := s.activateServer(); err != nil {
+		return err
+	}
+
+	if err := sendResponse(stream, &busResponse{NextSessionID: maxSessionID.Load() + 1}); err != nil { // ack ok
+		warning("send bus response failed: %v", err)
+		// Return nil to avoid redundant error response, but s.busStream remains nil
+		return nil
 	}
 
 	s.busStream = stream
@@ -74,22 +88,11 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 		return
 	}
 
-	if err := s.initBusStream(stream); err != nil {
+	if err := s.initBusAndServer(stream, &msg); err != nil {
 		sendError(stream, err)
 		return
 	}
-
-	s.initClientChecker(msg.HeartbeatTimeout)
-	s.clientAliveTime.addMilli(time.Now().UnixMilli())
-	s.aliveTimeout, s.intervalTime = msg.AliveTimeout, msg.IntervalTime
-
-	if err := s.activateServer(); err != nil {
-		sendError(stream, err)
-		return
-	}
-
-	if err := sendResponse(stream, &busResponse{NextSessionID: maxSessionID.Load() + 1}); err != nil { // ack ok
-		warning("send bus response failed: %v", err)
+	if s.busStream == nil { // // ACK failed, bus remains uninitialized
 		return
 	}
 

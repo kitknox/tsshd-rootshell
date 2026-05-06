@@ -206,19 +206,6 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 		return server
 	}
 
-	if args.KCP && args.Attachable || !args.KCP && !args.Attachable {
-		_ = os.Unsetenv("SSH_CONNECTION")
-		if v := os.Getenv("SSH_CONNECTION"); v != "" {
-			t.Fatalf("SSH_CONNECTION should be unset, got %q", v)
-		}
-	} else {
-		const kSshConn = "127.0.0.1 50818 127.0.0.1 22"
-		_ = os.Setenv("SSH_CONNECTION", kSshConn)
-		if v := os.Getenv("SSH_CONNECTION"); v != kSshConn {
-			t.Fatalf("SSH_CONNECTION mismatch: want %q, got %q", kSshConn, v)
-		}
-	}
-
 	output, err := initServer(args)
 	if err != nil {
 		t.Fatalf("init server failed: %v", err)
@@ -280,84 +267,53 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 	wg.Wait()
 }
 
-func TestProxy_QUIC(t *testing.T) {
-	runProxyEchoTest(t, &tsshdArgs{
-		KCP:            false,
-		TCP:            false,
-		Attachable:     false,
-		Port:           "31000-65000",
-		ConnectTimeout: 3 * time.Second,
-	})
-}
+func TestProxy(t *testing.T) {
+	tests := []struct {
+		name       string
+		kcp        bool
+		tcp        bool
+		attachable bool
+	}{
+		{"QUIC", false, false, false},
+		{"QUIC_TCP", false, true, false},
+		{"QUIC_Attachable", false, false, true},
+		{"QUIC_TCP_Attachable", false, true, true},
+		{"KCP", true, false, false},
+		{"KCP_TCP", true, true, false},
+		{"KCP_Attachable", true, false, true},
+		{"KCP_TCP_Attachable", true, true, true},
+	}
 
-func TestProxy_QUIC_TCP(t *testing.T) {
-	runProxyEchoTest(t, &tsshdArgs{
-		KCP:            false,
-		TCP:            true,
-		Attachable:     false,
-		Port:           "31000-65000",
-		ConnectTimeout: 3 * time.Second,
-	})
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := &tsshdArgs{
+				KCP:            tt.kcp,
+				TCP:            tt.tcp,
+				Attachable:     tt.attachable,
+				Port:           "31000-65000",
+				ConnectTimeout: 3 * time.Second,
+			}
 
-func TestProxy_QUIC_Attachable(t *testing.T) {
-	runProxyEchoTest(t, &tsshdArgs{
-		KCP:            false,
-		TCP:            false,
-		Attachable:     true,
-		Port:           "31000-65000",
-		ConnectTimeout: 3 * time.Second,
-	})
-}
+			t.Run("ListenAll", func(t *testing.T) {
+				_ = os.Unsetenv("SSH_CONNECTION")
+				if v := os.Getenv("SSH_CONNECTION"); v != "" {
+					t.Fatalf("SSH_CONNECTION should be unset, got %q", v)
+				}
 
-func TestProxy_QUIC_TCP_Attachable(t *testing.T) {
-	runProxyEchoTest(t, &tsshdArgs{
-		KCP:            false,
-		TCP:            true,
-		Attachable:     true,
-		Port:           "31000-65000",
-		ConnectTimeout: 3 * time.Second,
-	})
-}
+				runProxyEchoTest(t, args)
+			})
 
-func TestProxy_KCP(t *testing.T) {
-	runProxyEchoTest(t, &tsshdArgs{
-		KCP:            true,
-		TCP:            false,
-		Attachable:     false,
-		Port:           "31000-65000",
-		ConnectTimeout: 3 * time.Second,
-	})
-}
+			t.Run("ListenOne", func(t *testing.T) {
+				const mockSshConn = "127.0.0.1 50818 127.0.0.1 22"
+				t.Setenv("SSH_CONNECTION", mockSshConn)
+				if v := os.Getenv("SSH_CONNECTION"); v != mockSshConn {
+					t.Fatalf("SSH_CONNECTION mismatch: want %q, got %q", mockSshConn, v)
+				}
 
-func TestProxy_KCP_TCP(t *testing.T) {
-	runProxyEchoTest(t, &tsshdArgs{
-		KCP:            true,
-		TCP:            true,
-		Attachable:     false,
-		Port:           "31000-65000",
-		ConnectTimeout: 3 * time.Second,
-	})
-}
-
-func TestProxy_KCP_Attachable(t *testing.T) {
-	runProxyEchoTest(t, &tsshdArgs{
-		KCP:            true,
-		TCP:            false,
-		Attachable:     true,
-		Port:           "31000-65000",
-		ConnectTimeout: 3 * time.Second,
-	})
-}
-
-func TestProxy_KCP_TCP_Attachable(t *testing.T) {
-	runProxyEchoTest(t, &tsshdArgs{
-		KCP:            true,
-		TCP:            true,
-		Attachable:     true,
-		Port:           "31000-65000",
-		ConnectTimeout: 3 * time.Second,
-	})
+				runProxyEchoTest(t, args)
+			})
+		})
+	}
 }
 
 type mockFrontendConn struct {

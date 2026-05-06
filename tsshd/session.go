@@ -59,6 +59,12 @@ func (s *sshUdpServer) enablePendingInputDiscard() {
 	sessionMutex.Lock()
 	defer sessionMutex.Unlock()
 
+	if len(sessionMap) == 0 {
+		// No need to register and send the marker if there are no active sessions.
+		// Otherwise, concurrent session creation by the client might lead to garbled input.
+		return
+	}
+
 	idx := getNextDiscardMarkerIndex()
 	marker := []byte{0xFF, 0xC0, 0xC1, 0xFF,
 		byte(idx >> 24), byte(idx >> 16), byte(idx >> 8), byte(idx),

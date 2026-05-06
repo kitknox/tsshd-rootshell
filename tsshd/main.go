@@ -338,14 +338,17 @@ func handleExitSignals() {
 	)
 
 	sig := <-sigChan
+
 	if s := activeSshUdpServer.Load(); s != nil {
+		// Notify the client to initiate a graceful shutdown
 		if err := s.sendBusMessage("quit", quitMessage{fmt.Sprintf("receiving signal [%v] from the operating system", sig)}); err != nil {
 			warning("send quit message failed: %v", err)
 		}
 	}
-	go func() {
-		time.Sleep(time.Second) // give udp some time
-		debug("quit by signal wait timeout")
-		exitWithCode(kExitCodeSignalKill)
-	}()
+
+	// Allow a 1-second grace period for cleanup/UDP transmission
+	time.Sleep(time.Second)
+
+	debug("force quitting on signal [%v]: failed to exit in 1s (client might have disconnected)", sig)
+	exitWithCode(kExitCodeSignalKill)
 }
