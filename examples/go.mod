@@ -6,8 +6,8 @@ require (
 	charm.land/wish/v2 v2.0.1
 	github.com/charmbracelet/ssh v0.0.0-20250826160808-ebfa259c7309
 	github.com/creack/pty v1.1.24
-	github.com/trzsz/tsshd v0.1.6
-	golang.org/x/term v0.42.0
+	github.com/trzsz/tsshd v0.1.7
+	golang.org/x/term v0.43.0
 )
 
 require (
@@ -42,11 +42,11 @@ require (
 	github.com/trzsz/smux v1.6.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/xtaci/kcp-go/v5 v5.6.72 // indirect
-	golang.org/x/crypto v0.50.0 // indirect
-	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
-	golang.org/x/net v0.53.0 // indirect
+	golang.org/x/crypto v0.51.0 // indirect
+	golang.org/x/exp v0.0.0-20260508232706-74f9aab9d74a // indirect
+	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
 

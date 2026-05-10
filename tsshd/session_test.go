@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -43,6 +44,23 @@ type mockStream struct {
 	buf   bytes.Buffer
 	err   error
 	first bool
+}
+
+func TestGetSubsystemCmdEmptyCommand(t *testing.T) {
+	origPath := sshdConfigPath
+	origMap := sshdSubsystemMap
+	defer func() {
+		sshdConfigPath = origPath
+		sshdSubsystemMap = origMap
+	}()
+
+	sshdConfigPath = filepath.Join(t.TempDir(), "sshd_config")
+	sshdSubsystemMap = map[string]string{"sftp": `""`}
+
+	cmd, err := getSubsystemCmd("sftp")
+	require.Error(t, err)
+	require.Nil(t, cmd)
+	require.Contains(t, err.Error(), "command is empty")
 }
 
 func newMockStream() *mockStream {
@@ -485,7 +503,9 @@ func TestForwardOutput_KeepESC6nAfterReconnect(t *testing.T) {
 	}
 
 	go func() {
-		time.Sleep(100 * time.Millisecond)
+		for s.clientChecker.isTimeout() {
+			time.Sleep(time.Millisecond)
+		}
 		close(signal)
 	}()
 
@@ -576,8 +596,9 @@ func TestForwardOutput_ReconnectWhileReadBlocked(t *testing.T) {
 		runForwardOutputAndReconnect(s, reader, stream, nil)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-	assert.Equal("a\nb\nc\n", stream.String())
+	assert.Eventually(func() bool {
+		return stream.String() == "a\nb\nc\n"
+	}, time.Second, 10*time.Millisecond)
 
 	close(block)
 }

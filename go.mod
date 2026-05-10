@@ -12,9 +12,9 @@ require (
 	github.com/trzsz/shellescape v1.6.0
 	github.com/trzsz/smux v1.6.0
 	github.com/xtaci/kcp-go/v5 v5.6.72
-	golang.org/x/crypto v0.50.0
-	golang.org/x/net v0.53.0
-	golang.org/x/sys v0.43.0
+	golang.org/x/crypto v0.51.0
+	golang.org/x/net v0.54.0
+	golang.org/x/sys v0.44.0
 )
 
 require (

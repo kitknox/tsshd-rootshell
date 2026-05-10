@@ -53,6 +53,7 @@ nfpms:
   - id: tsshd
     builds:
       - tsshd
+    section: net
     file_name_template: >-
       {{ .ProjectName }}_
       {{- .Version }}_
@@ -63,10 +64,10 @@ nfpms:
       {{- else if eq .Arch "arm64" }}aarch64
       {{- else if eq .Arch "arm" }}armv{{ .Arm }}
       {{- else }}{{ .Arch }}{{ end }}
-    homepage: https://trzsz.github.io/
+    homepage: https://trzsz.github.io/tsshd
     maintainer: Lonny Wong <lonnywong@qq.com>
-    description: |-
-      tsshd is the trzsz-ssh(tssh) server that supports connection migration for roaming.
+    description: |
+      tsshd is a UDP-based SSH server with roaming support.
     license: MIT
     formats:
       - rpm

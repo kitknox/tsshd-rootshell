@@ -144,12 +144,12 @@ func initServer(args *tsshdArgs) (string, error) {
 		addOnExitFunc(func() { _ = listener.Close() })
 		go serveKCP(args, proxy, listener)
 	} else {
-		listener, err := listenQUIC(proxy, info, args.MTU)
+		listener, initialPacketSize, err := listenQUIC(proxy, info, args.MTU)
 		if err != nil {
 			return "", err
 		}
 		addOnExitFunc(func() { _ = listener.Close() })
-		go serveQUIC(args, proxy, listener)
+		go serveQUIC(args, proxy, listener, initialPacketSize)
 	}
 
 	infoStr, err := json.Marshal(info)
@@ -420,19 +420,19 @@ func listenKCP(conn net.PacketConn, info *ServerInfo, pass, salt []byte, delegTo
 	return listener, nil
 }
 
-func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listener, error) {
+func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listener, uint16, error) {
 	serverCertPEM, serverKeyPEM, err := generateCertKeyPair()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	clientCertPEM, clientKeyPEM, err := generateCertKeyPair()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	serverTlsCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("x509 key pair failed: %v", err)
+		return nil, 0, fmt.Errorf("x509 key pair failed: %v", err)
 	}
 
 	clientCertPool := x509.NewCertPool()
@@ -443,16 +443,17 @@ func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listen
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
 
+	config := quicConfig
 	if mtu > 0 {
-		quicConfig.InitialPacketSize = mtu
-		quicConfig.DisablePathMTUDiscovery = true
+		config.InitialPacketSize = mtu
+		config.DisablePathMTUDiscovery = true
 	} else {
-		quicConfig.InitialPacketSize = kDefaultMTU
+		config.InitialPacketSize = kDefaultMTU
 	}
 
-	listener, err := (&quic.Transport{Conn: conn}).Listen(tlsConfig, &quicConfig)
+	listener, err := (&quic.Transport{Conn: conn}).Listen(tlsConfig, &config)
 	if err != nil {
-		return nil, fmt.Errorf("quic listen failed: %v", err)
+		return nil, 0, fmt.Errorf("quic listen failed: %v", err)
 	}
 
 	info.Mode = kUdpModeQUIC
@@ -460,7 +461,7 @@ func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listen
 	info.ClientCert = fmt.Sprintf("%x", clientCertPEM)
 	info.ClientKey = fmt.Sprintf("%x", clientKeyPEM)
 
-	return listener, nil
+	return listener, config.InitialPacketSize, nil
 }
 
 func generateCertKeyPair() ([]byte, []byte, error) {
@@ -583,12 +584,10 @@ type quicDatagramConn struct {
 	mtu uint16
 }
 
-func newQuicDatagramConn(conn *quic.Conn) datagramConn {
+func newQuicDatagramConn(conn *quic.Conn, initialPacketSize uint16) datagramConn {
 	return &quicDatagramConn{
 		conn,
-		// This depends on quicConfig.InitialPacketSize being properly clamped to the valid MTU range.
-		// See TestQUIC_InitialPacketSize for the test that ensures this behavior.
-		quicConfig.InitialPacketSize - kQuicShortHeaderSize - kUdpForwardChannelIdSize, // Reserve 8 bytes from the MTU for the channel ID
+		initialPacketSize - kQuicShortHeaderSize - kUdpForwardChannelIdSize, // Reserve 8 bytes from the MTU for the channel ID
 	}
 }
 
@@ -649,7 +648,7 @@ func handleKcpConn(args *tsshdArgs, proxy *serverProxy, conn *kcp.UDPSession) {
 	}
 }
 
-func serveQUIC(args *tsshdArgs, proxy *serverProxy, listener *quic.Listener) {
+func serveQUIC(args *tsshdArgs, proxy *serverProxy, listener *quic.Listener, initialPacketSize uint16) {
 	for {
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
@@ -657,11 +656,11 @@ func serveQUIC(args *tsshdArgs, proxy *serverProxy, listener *quic.Listener) {
 			return
 		}
 		debug("quic accepted new connection from client [%v]", conn.RemoteAddr())
-		go handleQuicConn(args, proxy, conn)
+		go handleQuicConn(args, proxy, conn, initialPacketSize)
 	}
 }
 
-func handleQuicConn(args *tsshdArgs, proxy *serverProxy, conn *quic.Conn) {
+func handleQuicConn(args *tsshdArgs, proxy *serverProxy, conn *quic.Conn, initialPacketSize uint16) {
 	defer func() { _ = conn.CloseWithError(0, "") }()
 
 	if !args.Attachable {
@@ -670,7 +669,7 @@ func handleQuicConn(args *tsshdArgs, proxy *serverProxy, conn *quic.Conn) {
 		}
 	}
 
-	server := newSshUdpServer(args, proxy, conn.RemoteAddr(), &quicServer{conn, &udpForwarder{conn: newQuicDatagramConn(conn)}})
+	server := newSshUdpServer(args, proxy, conn.RemoteAddr(), &quicServer{conn, &udpForwarder{conn: newQuicDatagramConn(conn, initialPacketSize)}})
 	if server == nil {
 		return
 	}

@@ -93,7 +93,7 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
   <details><summary><code>sudo dnf install tsshd</code></summary>
 
   ```sh
-  sudo dnf copr enable @trzsz/tsshd
+  sudo dnf copr enable @trzsz/trzsz
   sudo dnf install tsshd
   ```
 
@@ -156,6 +156,24 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
   ```
 
   需要允许 `C:\Users\<user>\scoop\apps\tsshd\<version>\tsshd.exe` 通过防火墙，才能正常使用。
+
+  </details>
+
+- 用 pixi / conda / mamba 从 [conda-forge](https://github.com/conda-forge/tsshd-feedstock) 安装
+
+  <details><summary><code>pixi global install tsshd</code> / <code>conda install tsshd</code> / <code>mamba install tsshd</code></summary>
+
+  ```sh
+  pixi global install tsshd
+  ```
+
+  ```sh
+  conda install -c conda-forge tsshd
+  ```
+
+  ```sh
+  mamba install -c conda-forge tsshd
+  ```
 
   </details>
 

@@ -38,6 +38,8 @@ var sshdConfigPath string
 var sshdConfigMap map[string]string
 var sshdSubsystemMap map[string]string
 
+var matchCriteriaCommaRegexp = regexp.MustCompile(`\s*,\s*`)
+
 func getSshdConfigPath() string {
 	xdgConfigHome := os.Getenv("XDG_CONFIG_HOME")
 	if xdgConfigHome == "" {
@@ -225,6 +227,7 @@ func wildcardMatch(pattern, value string) bool {
 }
 
 func evalMatchLine(line, user string, groups []string) bool {
+	line = matchCriteriaCommaRegexp.ReplaceAllString(line, ",")
 	tokens := strings.Fields(line)
 	if len(tokens) == 0 {
 		return false
@@ -295,6 +298,18 @@ func evalMatchLine(line, user string, groups []string) bool {
 }
 
 func evalMatchConditions(conds map[string][]string, user string, groups []string) bool {
+	for key := range conds {
+		switch key {
+		case "user", "group", "all":
+		default:
+			// Be conservative: applying a Match block with criteria that we
+			// cannot evaluate may unintentionally relax security-sensitive
+			// options such as AllowTcpForwarding or DisableForwarding.
+			warning("sshd_config: unsupported Match criteria [%s] in [%s], ignoring Match block", key, sshdConfigPath)
+			return false
+		}
+	}
+
 	if pats, ok := conds["user"]; ok {
 		if !matchList(user, pats) {
 			return false
@@ -302,16 +317,39 @@ func evalMatchConditions(conds map[string][]string, user string, groups []string
 	}
 
 	if pats, ok := conds["group"]; ok {
-		groupOK := false
-		for _, g := range groups {
-			if matchList(g, pats) {
-				groupOK = true
-				break
-			}
-		}
-		if !groupOK {
+		if !matchGroupList(groups, pats) {
 			return false
 		}
+	}
+
+	return true
+}
+
+func matchGroupList(groups []string, patterns []string) bool {
+	hasPositive := false
+	positiveMatch := false
+
+	for _, p := range patterns {
+		pat := p
+		neg := strings.HasPrefix(p, "!")
+		if neg {
+			pat = strings.TrimSpace(p[1:])
+		} else {
+			hasPositive = true
+		}
+
+		for _, g := range groups {
+			if wildcardMatch(pat, g) {
+				if neg {
+					return false
+				}
+				positiveMatch = true
+			}
+		}
+	}
+
+	if hasPositive {
+		return positiveMatch
 	}
 
 	return true

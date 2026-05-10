@@ -242,6 +242,7 @@ func TestEvalMatchLine(t *testing.T) {
 	assert.False(evalMatchLine("group  !wheel", "john", []string{"wheel"}))
 	assert.False(evalMatchLine("Group=!admin,!docker", "john", []string{"docker"}))
 	assert.False(evalMatchLine("group  \t !wheel,!root", "john", []string{"root"}))
+	assert.False(evalMatchLine("Group=!wheel", "john", []string{"admin", "wheel"}))
 
 	// group wildcard
 	assert.True(evalMatchLine("Group=adm*", "john", []string{"admin", "docker"}))
@@ -258,7 +259,7 @@ func TestEvalMatchLine(t *testing.T) {
 	assert.True(evalMatchLine("group whee*,!wheel", "bob", []string{"wheex"}))
 	assert.False(evalMatchLine("group whee*,!wheel", "bob", []string{"wheel"}))
 	assert.False(evalMatchLine("Group=!adm*", "john", []string{"admin"}))
-	assert.True(evalMatchLine("Group=!adm*", "john", []string{"admin", "docker"}))
+	assert.False(evalMatchLine("Group=!adm*", "john", []string{"admin", "docker"}))
 	assert.True(evalMatchLine("Group=!wh*", "john", []string{"admin", "docker"}))
 
 	// user + group
@@ -275,7 +276,7 @@ func TestEvalMatchLine(t *testing.T) {
 
 	// with negation
 	assert.True(evalMatchLine("User=john Group=!wheel", "john", []string{"admin", "docker"}))
-	assert.True(evalMatchLine("User=john Group=!wheel", "john", []string{"admin", "wheel"}))
+	assert.False(evalMatchLine("User=john Group=!wheel", "john", []string{"admin", "wheel"}))
 	assert.False(evalMatchLine("User=!john Group=admin", "john", []string{"admin", "docker"}))
 
 	// mixed positive + negative
@@ -299,4 +300,10 @@ func TestEvalMatchLine(t *testing.T) {
 	assert.False(evalMatchLine("Group=wheel User=john", "john", []string{"admin", "docker"}))
 	assert.False(evalMatchLine("Group=admin User=bob", "john", []string{"admin", "docker"}))
 	assert.False(evalMatchLine("Group \t admin User  bob", "john", []string{"admin", "docker"}))
+
+	// Unsupported criteria must not match; otherwise a Match block for a
+	// different Address/Host/etc. could accidentally override restrictions.
+	assert.False(evalMatchLine("Address 192.0.2.*", "john", []string{"admin"}))
+	assert.False(evalMatchLine("User john Address 192.0.2.*", "john", []string{"admin"}))
+	assert.True(evalMatchLine("All", "john", []string{"admin"}))
 }
