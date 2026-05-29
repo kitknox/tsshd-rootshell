@@ -67,7 +67,7 @@ nfpms:
     homepage: https://trzsz.github.io/tsshd
     maintainer: Lonny Wong <lonnywong@qq.com>
     description: |
-      tsshd is a UDP-based SSH server with roaming support.
+      tsshd is a UDP-based SSH server with seamless roaming and auto-reconnect.
     license: MIT
     formats:
       - rpm

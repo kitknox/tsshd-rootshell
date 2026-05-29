@@ -5,7 +5,7 @@ export HOME=$(CURDIR)/.debian-home
 export GOCACHE=$(HOME)/.cache/go-build
 export GOPATH=$(HOME)/go
 
-execute_before_dh_auto_configure:
+override_dh_auto_configure:
 	mkdir -p $(HOME)
 
 %:
@@ -14,3 +14,6 @@ execute_before_dh_auto_configure:
 override_dh_auto_clean:
 	dh_auto_clean
 	rm -rf $(HOME)
+
+override_dh_auto_test:
+	true

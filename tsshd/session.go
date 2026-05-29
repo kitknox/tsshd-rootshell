@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"github.com/google/shlex"
+	"github.com/rcarmo/go-te/pkg/te"
 	"github.com/trzsz/shellescape"
 )
 
@@ -121,6 +122,9 @@ type sessionContext struct {
 	clientChecker   *replaceableTimeoutChecker
 	discardedBuffer []byte
 	discardMarker   atomic.Pointer[[]byte]
+	screenBuf       chan []byte
+	screenObj       *te.Screen
+	screenMu        sync.Mutex
 }
 
 var sessionMutex sync.Mutex
@@ -554,6 +558,17 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 		if n > 0 {
 			buf := make([]byte, n)
 			copy(buf, buffer[:n])
+			if c.screenBuf != nil {
+				select {
+				case c.screenBuf <- buf:
+				default:
+					select {
+					case c.screenBuf <- buf:
+					case <-time.After(100 * time.Millisecond):
+						warning("screen update blocked for 100ms, dropping %d bytes", len(buf))
+					}
+				}
+			}
 			handleBuffer(buf)
 		}
 		if err != nil {
@@ -565,8 +580,7 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 	debug("session [%d] %s completed", c.id, name)
 }
 
-func (c *sessionContext) forwardIO(server *sshUdpServer, stream Stream) {
-	ioStream := stream
+func (c *sessionContext) forwardIO(server *sshUdpServer, ioStream, errStream Stream) {
 	if server.args.Attachable {
 		c.ioStream = newReplaceableStream(ioStream)
 		ioStream = c.ioStream
@@ -580,12 +594,6 @@ func (c *sessionContext) forwardIO(server *sshUdpServer, stream Stream) {
 		c.outWG.Go(func() { c.forwardOutput("stdout", c.stdout, ioStream) })
 	}
 
-	var errStream Stream
-	if s := server.getStderrStream(c.id); s != nil {
-		errStream = s
-	} else {
-		errStream = &discardStream{}
-	}
 	if server.args.Attachable {
 		c.errStream = newReplaceableStream(errStream)
 		errStream = c.errStream
@@ -615,6 +623,9 @@ func (c *sessionContext) Wait() {
 	go func() {
 		c.outWG.Wait() // wait for the output first to prevent cmd.Wait close output too early
 		close(done)
+		if c.screenBuf != nil {
+			close(c.screenBuf)
+		}
 	}()
 
 	select {
@@ -711,6 +722,12 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 		return fmt.Errorf("resize pty failed: %v", err)
 	}
 
+	if c.screenObj != nil {
+		c.screenMu.Lock()
+		c.screenObj.Resize(rows, cols)
+		c.screenMu.Unlock()
+	}
+
 	c.cols, c.rows = cols, rows
 	return nil
 }
@@ -745,10 +762,22 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 		return
 	}
 
+	errID := msg.ID
 	if msg.Attach {
-		sess, err := s.attachSession(stream, &msg)
+		errID = msg.ErrID
+	}
+	var errStream Stream
+	if es := s.takeStderrStream(errID); es != nil {
+		defer func() { _ = es.Close() }()
+		errStream = es
+	} else {
+		errStream = &discardStream{}
+	}
+
+	if msg.Attach {
+		sess, code, err := s.attachSession(stream, errStream, &msg)
 		if err != nil {
-			sendError(stream, fmt.Errorf("attach to session [%d] failed: %v", msg.ID, err))
+			sendErrorCode(stream, code, fmt.Sprintf("attach to session [%d] failed: %v", msg.ID, err))
 			return
 		}
 
@@ -789,7 +818,7 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 		sess.showMotd(stream)
 	}
 
-	sess.forwardIO(s, stream)
+	sess.forwardIO(s, stream, errStream)
 
 	if s.args.Attachable {
 		// Each session is started only once since duplicate session IDs are rejected,
@@ -842,6 +871,27 @@ func newSessionContext(server *sshUdpServer, msg *startMessage) (*sessionContext
 	}
 	sess.server.Store(server)
 
+	if server.args.Attachable && server.args.Socket {
+		sess.screenBuf = make(chan []byte, 1000)
+		sess.screenObj = te.NewScreen(sess.cols, sess.rows)
+		go func() {
+			stream := te.NewStream(sess.screenObj, false)
+			for buf := range sess.screenBuf {
+				data := string(buf)
+				sess.screenMu.Lock()
+				err := stream.Feed(data)
+				sess.screenMu.Unlock()
+				if err != nil && enableDebugLogging {
+					content := strconv.QuoteToASCII(data)
+					if len(content) > 256 {
+						content = content[:256] + "..."
+					}
+					debug("screen feed failed: %v, data=%s", err, content)
+				}
+			}
+		}()
+	}
+
 	if sessionMap == nil {
 		sessionMap = make(map[uint64]*sessionContext)
 	}
@@ -868,11 +918,9 @@ func (c *stderrStream) Close() error {
 
 	c.wg.Done()
 
-	c.server.stderrMutex.Lock()
-	delete(c.server.stderrMap, c.id)
-	c.server.stderrMutex.Unlock()
-
-	return c.Stream.Close()
+	// Send an EOF signal to the client as early as possible to indicate that stderr has finished.
+	// The actual underlying stream will be fully closed by sshUdpServer.handleStream after Wait returns.
+	return c.CloseWrite()
 }
 
 func (s *sshUdpServer) newStderrStream(id uint64, stream Stream) (*stderrStream, error) {
@@ -894,15 +942,26 @@ func (s *sshUdpServer) newStderrStream(id uint64, stream Stream) (*stderrStream,
 	return errStream, nil
 }
 
-func (s *sshUdpServer) getStderrStream(id uint64) *stderrStream {
+func (s *sshUdpServer) takeStderrStream(id uint64) *stderrStream {
 	s.stderrMutex.Lock()
 	defer s.stderrMutex.Unlock()
 
 	if errStream, ok := s.stderrMap[id]; ok {
+		delete(s.stderrMap, id)
 		return errStream
 	}
 
 	return nil
+}
+
+func (s *sshUdpServer) closeAllStderrStreams() {
+	s.stderrMutex.Lock()
+	defer s.stderrMutex.Unlock()
+
+	for id, stream := range s.stderrMap {
+		delete(s.stderrMap, id)
+		_ = stream.Close()
+	}
 }
 
 func getSessionStartCmd(msg *startMessage) (*exec.Cmd, error) {
@@ -1286,7 +1345,7 @@ func (c *sessionContext) handleAgentRequest(msg *startMessage) {
 		return
 	}
 
-	listener, agentPath, err := listenForAgent()
+	listener, agentPath, err := listenForAgent(c.id)
 	if err != nil {
 		warning("listen for agent forwarding failed: %v", err)
 		return
@@ -1320,6 +1379,7 @@ func (c *sessionContext) handleChannelAccept(listener net.Listener, channelType 
 				return
 			}
 			id := server.addAcceptConn(conn)
+			server.reapAcceptConnAfterTimeout(id)
 			if err := server.sendBusMessage("channel", &channelMessage{ChannelType: channelType, ID: id}); err != nil {
 				warning("send channel message failed: %v", err)
 			}

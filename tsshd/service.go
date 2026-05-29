@@ -115,10 +115,10 @@ func (s *quicServer) getUdpForwarder() *udpForwarder {
 	return s.forwarder
 }
 
-func initServer(args *tsshdArgs) (string, error) {
+func initServer(args *tsshdArgs) (*ServerInfo, string, error) {
 	conn, port, err := listenOnFreePort(args)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
 
 	if enableDebugLogging {
@@ -133,20 +133,20 @@ func initServer(args *tsshdArgs) (string, error) {
 
 	proxy, err := startServerProxy(args, info, conn)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
 
 	if args.KCP {
 		listener, err := listenKCP(proxy, info, proxy.kcpPass, proxy.kcpSalt, true)
 		if err != nil {
-			return "", err
+			return nil, "", err
 		}
 		addOnExitFunc(func() { _ = listener.Close() })
 		go serveKCP(args, proxy, listener)
 	} else {
 		listener, initialPacketSize, err := listenQUIC(proxy, info, args.MTU)
 		if err != nil {
-			return "", err
+			return nil, "", err
 		}
 		addOnExitFunc(func() { _ = listener.Close() })
 		go serveQUIC(args, proxy, listener, initialPacketSize)
@@ -154,10 +154,10 @@ func initServer(args *tsshdArgs) (string, error) {
 
 	infoStr, err := json.Marshal(info)
 	if err != nil {
-		return "", fmt.Errorf("json marshal failed: %v", err)
+		return nil, "", fmt.Errorf("json marshal failed: %v", err)
 	}
 
-	return string(infoStr), nil
+	return info, string(infoStr), nil
 }
 
 func parsePortRanges(tsshdPort string) [][2]uint16 {
@@ -532,8 +532,16 @@ func (s *quicStream) CloseWrite() error {
 }
 
 func (s *quicStream) Close() error {
-	_ = s.CloseRead()
-	return s.CloseWrite()
+	s.CancelRead(0)
+
+	// It is CRITICAL to call CancelWrite here.
+	// If a Write() is blocked because the client has disappeared, a standard Close()
+	// will keep the data in memory, waiting for ACKs that will never arrive.
+	// CancelWrite forcefully discards the outbound buffer and prevents a memory leak.
+	s.CancelWrite(0)
+
+	// In this context, CancelWrite is sufficient to release stream resources.
+	return nil
 }
 
 type kcpDatagramConn struct {
@@ -608,7 +616,10 @@ func serveKCP(args *tsshdArgs, proxy *serverProxy, listener *kcp.Listener) {
 }
 
 func handleKcpConn(args *tsshdArgs, proxy *serverProxy, conn *kcp.UDPSession) {
-	defer func() { _ = conn.Close() }()
+	defer func() {
+		err := conn.Close()
+		debug("kcp connection [%v] closed: %v", conn.RemoteAddr(), err)
+	}()
 
 	if !args.Attachable {
 		if s := activeSshUdpServer.Load(); s != nil && s.serving.Load() {
@@ -661,7 +672,10 @@ func serveQUIC(args *tsshdArgs, proxy *serverProxy, listener *quic.Listener, ini
 }
 
 func handleQuicConn(args *tsshdArgs, proxy *serverProxy, conn *quic.Conn, initialPacketSize uint16) {
-	defer func() { _ = conn.CloseWithError(0, "") }()
+	defer func() {
+		err := conn.CloseWithError(0, "")
+		debug("quic connection [%v] closed: %v", conn.RemoteAddr(), err)
+	}()
 
 	if !args.Attachable {
 		if s := activeSshUdpServer.Load(); s != nil && s.serving.Load() {

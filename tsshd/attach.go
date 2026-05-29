@@ -29,10 +29,78 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var attachMutex sync.Mutex
+
+type writeResult struct {
+	n   int
+	err error
+}
+
+type interruptibleStream struct {
+	Stream
+	mu      sync.Mutex
+	bufCh   chan []byte
+	ackCh   chan writeResult
+	closeCh chan struct{}
+	closed  atomic.Bool
+}
+
+func (s *interruptibleStream) Close() error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	close(s.closeCh)
+	return s.Stream.Close()
+}
+
+func (s *interruptibleStream) Write(buf []byte) (int, error) {
+	if s.closed.Load() {
+		return 0, fmt.Errorf("stream closed")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	select {
+	case s.bufCh <- buf:
+	case <-s.closeCh:
+		return 0, fmt.Errorf("stream closed")
+	}
+
+	select {
+	case result := <-s.ackCh:
+		return result.n, result.err
+	case <-s.closeCh:
+		return 0, fmt.Errorf("stream closed")
+	}
+}
+
+func newInterruptibleStream(s Stream) *interruptibleStream {
+	ss := &interruptibleStream{
+		Stream:  s,
+		bufCh:   make(chan []byte),
+		ackCh:   make(chan writeResult, 1),
+		closeCh: make(chan struct{}),
+	}
+
+	go func() {
+		for {
+			select {
+			case buf := <-ss.bufCh:
+				n, err := ss.Stream.Write(buf)
+				ss.ackCh <- writeResult{n, err}
+			case <-ss.closeCh:
+				return
+			}
+		}
+	}()
+
+	return ss
+}
 
 type replaceableStream struct {
 	mu     sync.Mutex
@@ -42,7 +110,7 @@ type replaceableStream struct {
 }
 
 func newReplaceableStream(s Stream) *replaceableStream {
-	ss := &replaceableStream{stream: s}
+	ss := &replaceableStream{stream: newInterruptibleStream(s)}
 	ss.cond = sync.NewCond(&ss.mu)
 	return ss
 }
@@ -61,13 +129,17 @@ func (s *replaceableStream) swap(newStream Stream) {
 	}
 
 	oldStream := s.stream
-	s.stream = newStream
+	if newStream == nil {
+		s.stream = nil
+	} else {
+		s.stream = newInterruptibleStream(newStream)
+	}
 
 	s.cond.Broadcast()
 	s.mu.Unlock()
 
 	if oldStream != nil {
-		_ = oldStream.Close()
+		go func() { _ = oldStream.Close() }()
 	}
 }
 
@@ -319,9 +391,9 @@ func (d *discardStream) SetWriteDeadline(t time.Time) error { return nil }
 func (d *discardStream) CloseRead() error                   { return nil }
 func (d *discardStream) CloseWrite() error                  { return nil }
 
-func (s *sshUdpServer) attachSession(stream Stream, msg *startMessage) (*sessionContext, error) {
+func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessage) (*sessionContext, ErrCode, error) {
 	if !s.args.Attachable {
-		return nil, fmt.Errorf("attach is not allowed: tsshd was not started with --attachable")
+		return nil, 0, fmt.Errorf("attach is not allowed: tsshd was not started with --attachable")
 	}
 
 	sessionMutex.Lock()
@@ -329,53 +401,51 @@ func (s *sshUdpServer) attachSession(stream Stream, msg *startMessage) (*session
 	sessionMutex.Unlock()
 
 	if !ok {
-		return nil, fmt.Errorf("session not found")
+		return nil, 0, fmt.Errorf("session not found")
 	}
 
 	if sess.closed.Load() {
-		return nil, fmt.Errorf("session is closed")
+		return nil, 0, fmt.Errorf("session is closed")
+	}
+
+	pty := (sess.mwSess != nil && sess.mwSess.pty) || sess.pty != nil
+	if msg.Pty && !pty {
+		return nil, ErrNotPty, fmt.Errorf("not a pty session")
 	}
 
 	attachMutex.Lock()
 	defer attachMutex.Unlock()
 
 	if server := activeSshUdpServer.Load(); server != s {
-		return nil, fmt.Errorf("server is no longer active")
+		return nil, 0, fmt.Errorf("server is no longer active")
 	}
 
 	if sess.server.Load() != nil {
-		return nil, fmt.Errorf("session already attached")
+		return nil, 0, fmt.Errorf("session already attached")
 	}
 	if sess.ioStream == nil {
-		return nil, fmt.Errorf("invalid session state: i/o stream is nil")
+		return nil, 0, fmt.Errorf("invalid session state: i/o stream is nil")
 	}
 	if sess.errStream == nil {
-		return nil, fmt.Errorf("invalid session state: err stream is nil")
+		return nil, 0, fmt.Errorf("invalid session state: err stream is nil")
 	}
 
-	if err := sendSuccess(stream); err != nil { // ack ok
-		return nil, fmt.Errorf("ack ok failed: %v", err)
+	if err := sendSuccess(ioStream); err != nil { // ack ok
+		return nil, 0, fmt.Errorf("ack ok failed: %v", err)
 	}
 
 	// The server reference must be updated before replacing the I/O stream,
 	// since incoming data may immediately require the server instance.
 	sess.server.Store(s)
 
-	sess.ioStream.swap(stream)
-
-	var errStream Stream
-	if es := s.getStderrStream(msg.ErrID); es != nil {
-		errStream = es
-	} else {
-		errStream = &discardStream{}
-	}
+	sess.ioStream.swap(ioStream)
 	sess.errStream.swap(errStream)
 
 	// The client checker is updated after stream setup to ensure streams
 	// are ready when the client checker reports the client reconnected.
 	sess.clientChecker.swap(s.clientChecker)
 
-	if sess.mwSess != nil && sess.mwSess.pty || sess.pty != nil {
+	if pty {
 		if msg.Cols > 0 && msg.Rows > 0 {
 			sess.cols, sess.rows = msg.Cols, msg.Rows
 		}
@@ -387,7 +457,7 @@ func (s *sshUdpServer) attachSession(stream Stream, msg *startMessage) (*session
 
 	debug("session [%d] attached by client [%x]", msg.ID, s.client.proxyAddr.clientID)
 
-	return sess, nil
+	return sess, 0, nil
 }
 
 func (s *sshUdpServer) detachAllSessions() {

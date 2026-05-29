@@ -96,6 +96,7 @@ type UdpClientOptions struct {
 	IPv4             bool
 	IPv6             bool
 	TsshdAddr        string
+	SessionName      string
 	ServerInfo       *ServerInfo
 	AliveTimeout     time.Duration
 	IntervalTime     time.Duration
@@ -189,6 +190,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 
 	if err := sendMessage(busStream, busMessage{
 		ClientVer:        kTsshdVersion,
+		SessionName:      opts.SessionName,
 		AliveTimeout:     opts.AliveTimeout,
 		IntervalTime:     opts.IntervalTime,
 		HeartbeatTimeout: opts.HeartbeatTimeout}); err != nil {
@@ -491,6 +493,17 @@ func (c *SshUdpClient) GetLastReconnectError() error {
 // can be sent in a single datagram over this SshUdpClient.
 func (c *SshUdpClient) GetMaxDatagramSize() uint16 {
 	return c.protoClient.getUdpForwarder().conn.GetMaxDatagramSize()
+}
+
+// IsConnectionLost returns true if the underlying transport is currently unable to reach the server.
+func (c *SshUdpClient) IsConnectionLost() bool {
+	return c.activeChecker.isTimeout()
+}
+
+// WaitUntilReconnected blocks until the transport layer restores its connection to the server,
+// allowing data transmission to resume.
+func (c *SshUdpClient) WaitUntilReconnected() error {
+	return c.activeChecker.waitUntilReconnected()
 }
 
 func (c *SshUdpClient) tryToReconnect() {
@@ -1194,6 +1207,7 @@ func (s *SshUdpSession) Attach(id uint64) error {
 	msg := startMessage{
 		ID:     id,
 		ErrID:  s.id,
+		Pty:    s.pty,
 		Attach: true,
 		Cols:   s.width,
 		Rows:   s.height,

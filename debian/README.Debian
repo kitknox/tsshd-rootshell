@@ -1,6 +1,6 @@
 tsshd for Debian
 ---------------
 
-tsshd: UDP-based SSH server with roaming support.
+tsshd is a UDP-based SSH server with seamless roaming and auto-reconnect.
 
  -- Lonny Wong <lonnywong@qq.com>  Sun, 30 Jun 2024 17:38:13 +0800

@@ -49,7 +49,9 @@ type ErrCode int
 
 const (
 	// ErrProhibited is an error indicating administratively prohibited
-	ErrProhibited ErrCode = iota + 101
+	ErrProhibited ErrCode = 101
+	// ErrNotPty indicates the session does not support PTY
+	ErrNotPty ErrCode = 102
 )
 
 // String converts the error code to human readable form
@@ -57,8 +59,10 @@ func (c ErrCode) String() string {
 	switch c {
 	case ErrProhibited:
 		return "ErrProhibited"
+	case ErrNotPty:
+		return "ErrNotPty"
 	default:
-		return "UnknownError" + strconv.Itoa(int(c))
+		return fmt.Sprintf("ErrCode(%d)", c)
 	}
 }
 
@@ -93,6 +97,22 @@ type ServerInfo struct {
 	MTU        uint16 `json:",omitempty"`
 }
 
+type SessionInfo struct {
+	ID    uint64 `json:",omitempty"`
+	Title string `json:",omitempty"`
+}
+
+type BaseInfo struct {
+	Time     int64         `json:",omitempty"`
+	Name     string        `json:",omitempty"`
+	Sessions []SessionInfo `json:",omitempty"`
+}
+
+type ServerItem struct {
+	Pid  int    `json:",omitempty"`
+	Info string `json:",omitempty"`
+}
+
 type errorMessage struct {
 	Code ErrCode `json:",omitempty"`
 	Msg  string  `json:",omitempty"`
@@ -108,6 +128,7 @@ type busMessage struct {
 	AliveTimeout     time.Duration `json:",omitempty"`
 	IntervalTime     time.Duration `json:",omitempty"`
 	HeartbeatTimeout time.Duration `json:",omitempty"`
+	SessionName      string        `json:",omitempty"`
 }
 
 type busResponse struct {
@@ -245,6 +266,10 @@ type rekeyMessage struct {
 	PubKey []byte `json:",omitempty"`
 }
 
+type viewMessage struct {
+	ID uint64 `json:",omitempty"`
+}
+
 func writeAll(dst io.Writer, data []byte) error {
 	m := 0
 	l := len(data)
@@ -258,7 +283,7 @@ func writeAll(dst io.Writer, data []byte) error {
 	return nil
 }
 
-func sendCommand(stream Stream, command string) error {
+func sendCommand(stream io.Writer, command string) error {
 	if len(command) == 0 {
 		return fmt.Errorf("send command is empty")
 	}
@@ -274,7 +299,7 @@ func sendCommand(stream Stream, command string) error {
 	return nil
 }
 
-func recvCommand(stream Stream) (string, error) {
+func recvCommand(stream io.Reader) (string, error) {
 	length := make([]byte, 1)
 	if _, err := stream.Read(length); err != nil {
 		return "", fmt.Errorf("recv command read length failed: %w", err)
@@ -300,7 +325,7 @@ func sendMessage(stream Stream, msg any) error {
 	return nil
 }
 
-func recvMessage(stream Stream, msg any) error {
+func recvMessage(stream io.Reader, msg any) error {
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(stream, lenBuf); err != nil {
 		return fmt.Errorf("recv message read length failed: %w", err)
@@ -318,7 +343,7 @@ func recvMessage(stream Stream, msg any) error {
 	return nil
 }
 
-func sendCommandAndMessage(stream Stream, command string, msg any) error {
+func sendCommandAndMessage(stream io.Writer, command string, msg any) error {
 	if len(command) == 0 {
 		return fmt.Errorf("send command is empty")
 	}

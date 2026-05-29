@@ -1,4 +1,4 @@
-## tsshd: UDP-based SSH Server with Roaming Support
+## tsshd: UDP-based SSH Server with Seamless Roaming and Auto-Reconnect
 
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg?style=flat)](https://choosealicense.com/licenses/mit/)
 [![GitHub Release](https://img.shields.io/github/v/release/trzsz/tsshd)](https://github.com/trzsz/tsshd/releases)
@@ -45,7 +45,7 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
    - Alternatively, configure the following in `~/.ssh/config` to omit the `--udp` or `--kcp` option:
      ```
      Host xxx
-         #!! UdpMode  ( Yes | QUIC | KCP )
+         #!! UdpMode  ( yes | QUIC | KCP )
      ```
 
 ### How it works
@@ -206,7 +206,7 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
 
   </details>
 
-- Download from the [GitHub Releases](https://github.com/trzsz/tsshd/releases) and install locally
+- Download from the [GitHub Releases](https://github.com/trzsz/tsshd/releases) (or [Pre-Release](https://github.com/trzsz/tsshd/releases/tag/dev)) and install locally
 
   <details><summary><code>download and install locally</code></summary>
 
@@ -286,7 +286,7 @@ The following clients or terminals support the `tsshd` server:
 
 ```
 Host xxx
-    #!! UdpMode Yes
+    #!! UdpMode yes
     #!! TsshdPort 61001-61999
     #!! TsshdPath ~/go/bin/tsshd
     #!! UdpAliveTimeout 86400
@@ -296,9 +296,11 @@ Host xxx
     #!! ShowFullNotifications yes
     #!! UdpProxyMode UDP
     #!! UdpMTU 1400
+    #!! UdpSessionAttach no
+    #!! UdpSessionName xxx
 ```
 
-- `UdpMode`: `No` (the default: tssh works in TCP mode), `Yes` (default protocol: `QUIC`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) protocol: faster speed), `KCP` ([KCP](https://github.com/xtaci/kcp-go) protocol: lower latency).
+- `UdpMode`: `no` (the default: tssh works in TCP mode), `yes` (default protocol: `QUIC`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) protocol: faster speed), `KCP` ([KCP](https://github.com/xtaci/kcp-go) protocol: lower latency).
 
 - `TsshdPort`: Specifies the port range that tsshd listens on, default is [61001, 61999]. You can specify multiple discrete ports (e.g., `6022,7022`) or multiple discrete ranges (e.g., `8010-8020,9020-9030,10080`); tsshd will randomly choose an available port. You can also specify the port on the command line using `--tsshd-port`.
 
@@ -310,13 +312,17 @@ Host xxx
 
 - `UdpReconnectTimeout`: If the disconnection lasts longer than `UdpReconnectTimeout` in seconds, tssh will display a notification indicating that the connection has been lost. The default is 15 seconds.
 
-- `ShowNotificationOnTop`: Whether the connection loss notification is displayed on the top. The default is yes, which may overwrite some of the previous output. Set it to `No` to display notifications on the current line of the cursor.
+- `ShowNotificationOnTop`: Whether the connection loss notification is displayed on the top. The default is yes, which may overwrite some of the previous output. Set it to `no` to display notifications on the current line of the cursor.
 
-- `ShowFullNotifications`: Whether to display the full notifications or a brief notification. The default is yes, which may output several lines to the screen. Set it to `No` will output only one line.
+- `ShowFullNotifications`: Whether to display the full notifications or a brief notification. The default is yes, which may output several lines to the screen. Set it to `no` will output only one line.
 
 - `UdpProxyMode`: The default transport protocol is `UDP`. If `UDP` traffic is blocked by firewalls in your network environment, you can set it to `TCP` to work around the restriction, though this may introduce additional latency.
 
 - `UdpMTU`: Sets the maximum transmission unit (MTU) for UDP packets. Default is 1400.
+
+- `UdpSessionAttach`: Defaults to `no`. When set to `yes`, it allows attaching to an existing session on the server. Meanwhile, the current session will also be made attachable, allowing you to re-attach to it later when logging in from other devices or networks.
+
+- `UdpSessionName`: Customizes the session name. This only takes effect when `UdpSessionAttach` is set to `yes` or when logging in with the `--attach` argument. If a session with this name already exists on the server, it will attach directly; if not, a new session with this name will be created for automatic attachment in future logins.
 
 ### UDP Port Forwarding
 
@@ -438,6 +444,12 @@ To help you get started quickly, we provide fully working sample code in the [`e
   A complete showcase of the **Hybrid Architecture** mentioned above. It implements the adapter pattern to unify the `Session` interface, allowing the same business logic to run seamlessly across a traditional TCP SSH server (Wish) and the low-latency UDP `tsshd` server, complete with the process handoff mechanism.
 
 > **Tip**: You can run these examples locally and test them using the `tssh` client to experience the low-latency and roaming features firsthand!
+
+### Screenshot
+
+![tsshd attach session](https://trzsz.github.io/images/tsshd_attach.gif)
+
+![tsshd auto reconnect](https://trzsz.github.io/images/tsshd_conn.gif)
 
 ### Contact
 

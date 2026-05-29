@@ -12,4 +12,4 @@ Vcs-Git: https://github.com/trzsz/tsshd.git
 Package: tsshd
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
-Description: tsshd: UDP-based SSH server with roaming support.
+Description: tsshd is a UDP-based SSH server with seamless roaming and auto-reconnect.

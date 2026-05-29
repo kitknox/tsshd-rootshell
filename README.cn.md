@@ -1,4 +1,4 @@
-# tsshd: 基于 UDP 支持漫游的 SSH 服务器
+# tsshd: 基于 UDP、支持漫游与断线重连的 SSH 服务端
 
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg?style=flat)](https://choosealicense.com/licenses/mit/)
 [![GitHub Release](https://img.shields.io/github/v/release/trzsz/tsshd)](https://github.com/trzsz/tsshd/releases)
@@ -45,7 +45,7 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
    - 可在 `~/.ssh/config` 中进行如下配置，以省略手动指定 `--udp` 或 `--kcp` 选项：
      ```
      Host xxx
-         #!! UdpMode  ( Yes | QUIC | KCP )
+         #!! UdpMode  ( yes | QUIC | KCP )
      ```
 
 ## 原理简介
@@ -206,7 +206,7 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
   </details>
 
-- 可从 [GitHub Releases](https://github.com/trzsz/tsshd/releases) 中下载，国内可从 [Gitee 发行版](https://gitee.com/trzsz/tsshd/releases) 中下载，然后本地安装。
+- 可从 [GitHub Releases](https://github.com/trzsz/tsshd/releases) 或 [Pre-Release](https://github.com/trzsz/tsshd/releases/tag/dev) 中下载，国内可从 [Gitee 发行版](https://gitee.com/trzsz/tsshd/releases) 中下载，然后本地安装。
 
   <details><summary><code>下载并本地安装</code></summary>
 
@@ -286,7 +286,7 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
 ```
 Host xxx
-    #!! UdpMode Yes
+    #!! UdpMode yes
     #!! TsshdPort 61001-61999
     #!! TsshdPath ~/go/bin/tsshd
     #!! UdpAliveTimeout 86400
@@ -296,9 +296,11 @@ Host xxx
     #!! ShowFullNotifications yes
     #!! UdpProxyMode UDP
     #!! UdpMTU 1400
+    #!! UdpSessionAttach no
+    #!! UdpSessionName xxx
 ```
 
-- `UdpMode`: `No` (默认为`No`: tssh 工作在 TCP 模式), `Yes` (默认协议: `QUIC`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) 协议：速度更快), `KCP` ([KCP](https://github.com/xtaci/kcp-go) 协议：延迟更低).
+- `UdpMode`: `no` (默认为`no`: tssh 工作在 TCP 模式), `yes` (默认协议: `QUIC`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) 协议：速度更快), `KCP` ([KCP](https://github.com/xtaci/kcp-go) 协议：延迟更低).
 
 - `TsshdPort`: 指定 tsshd 监听的端口范围，默认值为 [61001, 61999]。支持指定离散的端口列表(如`6022,7022`)，也支持指定离散的端口范围(如`8010-8020,9020-9030,10080`)，tsshd 会随机监听其中一个空闲的端口。也可在命令行中使用 `--tsshd-port` 指定端口。
 
@@ -310,13 +312,17 @@ Host xxx
 
 - `UdpReconnectTimeout`: 如果断开连接的时间超过 `UdpReconnectTimeout` 秒，tssh 将会显示失去连接的通知公告。默认值为 15 秒。
 
-- `ShowNotificationOnTop`: 是否在屏幕顶部显示失去连接的通知。默认为 yes，这可能会覆盖之前的一些输出。设置为 `No` 在光标当前行显示通知。
+- `ShowNotificationOnTop`: 是否在屏幕顶部显示失去连接的通知。默认为 yes，这可能会覆盖之前的一些输出。设置为 `no` 在光标当前行显示通知。
 
-- `ShowFullNotifications`: 是显示完整的通知，还是显示简短的通知。默认为 yes，这可能会输出几行通知到屏幕上。设置为 `No` 只输出一行通知。
+- `ShowFullNotifications`: 是显示完整的通知，还是显示简短的通知。默认为 yes，这可能会输出几行通知到屏幕上。设置为 `no` 只输出一行通知。
 
 - `UdpProxyMode`: 默认使用 `UDP` 协议进行传输。如果所在的网络环境有防火墙禁止了 `UDP` 流量，可以配置为 `TCP` 以绕过防火墙限制，但这可能会带来额外的延迟。
 
 - `UdpMTU`: 设置 UDP 数据包的最大传输单元（MTU），默认值为 1400。
+
+- `UdpSessionAttach`: 默认为 `no`。配置为 `yes` 时，允许附加到服务器上已存在的会话；同时，本次登录的会话也会运行在可附加模式下，支持后续在其他设备或网络下重新登录时附加。
+
+- `UdpSessionName`: 自定义会话名称。仅在 `UdpSessionAttach` 配置为 `yes` 或通过 `--attach` 参数登录时生效。若服务器端已存在该名称的会话，将直接附加；若不存在，则以此名称创建新会话，供后续登录时自动附加。
 
 ## UDP 端口转发
 
@@ -438,6 +444,12 @@ func handleBusiness(sess Session) {
   上述**混合架构**的完整展示。它实现了适配器模式以统一 `Session` 接口，允许相同的业务逻辑在传统的 TCP SSH 服务器（Wish）和低延迟的 UDP `tsshd` 服务器之间无缝运行，并包含完整的进程切换（Handoff）机制。
 
 > **提示**：您可以在本地运行这些示例，并使用 `tssh` 客户端进行测试，以亲身体验低延迟和漫游功能！
+
+## 屏幕截图
+
+![tsshd attach session](https://trzsz.github.io/images/tsshd_attach.gif)
+
+![tsshd auto reconnect](https://trzsz.github.io/images/tsshd_conn.gif)
 
 ## 联系方式
 
