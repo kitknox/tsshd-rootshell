@@ -43,9 +43,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/quic-go/quic-go"
+	"github.com/trzsz/kcp-go/v5"
+	"github.com/trzsz/quic-go"
 	"github.com/trzsz/smux"
-	"github.com/xtaci/kcp-go/v5"
 )
 
 const (
@@ -78,18 +78,27 @@ var smuxConfig = smux.Config{
 	Version:           2,
 	KeepAliveDisabled: true,
 	MaxFrameSize:      48 * 1024,
-	MaxStreamBuffer:   10 * 1024 * 1024,
 	MaxReceiveBuffer:  20 * 1024 * 1024,
+
+	// Smaller MaxStreamBuffer may reduce throughput on high-latency networks.
+	// Larger MaxStreamBuffer may slow recovery after reconnection when the server has accumulated a large amount of output.
+	MaxStreamBuffer: 512 * 1024,
 }
 
 type protocolServer interface {
+	reset()
 	closeServer() error
 	getUdpForwarder() *udpForwarder
 }
 
 type kcpServer struct {
+	conn      *kcp.UDPSession
 	session   *smux.Session
 	forwarder *udpForwarder
+}
+
+func (s *kcpServer) reset() {
+	s.conn.ResetRTO()
 }
 
 func (s *kcpServer) closeServer() error {
@@ -104,6 +113,10 @@ func (s *kcpServer) getUdpForwarder() *udpForwarder {
 type quicServer struct {
 	conn      *quic.Conn
 	forwarder *udpForwarder
+}
+
+func (s *quicServer) reset() {
+	s.conn.ResetPTO()
 }
 
 func (s *quicServer) closeServer() error {
@@ -127,6 +140,7 @@ func initServer(args *tsshdArgs) (*ServerInfo, string, error) {
 
 	info := &ServerInfo{
 		ServerVer: kTsshdVersion,
+		ProtoVer:  kTsshdProtocol,
 		Port:      port,
 		MTU:       args.MTU,
 	}
@@ -137,10 +151,13 @@ func initServer(args *tsshdArgs) (*ServerInfo, string, error) {
 	}
 
 	if args.KCP {
-		listener, err := listenKCP(proxy, info, proxy.kcpPass, proxy.kcpSalt, true)
+		listener, crypto, err := listenKCP(proxy, info, args.Attachable)
 		if err != nil {
 			return nil, "", err
 		}
+
+		proxy.kcpCrypto = crypto
+
 		addOnExitFunc(func() { _ = listener.Close() })
 		go serveKCP(args, proxy, listener)
 	} else {
@@ -362,7 +379,7 @@ func listenOnFreePort(args *tsshdArgs) (frontendConnection, int, error) {
 	return nil, 0, fmt.Errorf("listen udp on [%s] failed", tsshdPort)
 }
 
-func udpListenOnPort(addrs []*net.UDPAddr, port int) (fc frontendConnection, err error) {
+func udpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err error) {
 	var connList []*net.UDPConn
 	defer func() {
 		if err != nil {
@@ -383,7 +400,7 @@ func udpListenOnPort(addrs []*net.UDPAddr, port int) (fc frontendConnection, err
 	return &udpFrontendConn{connList: connList}, nil
 }
 
-func tcpListenOnPort(addrs []*net.UDPAddr, port int) (fc frontendConnection, err error) {
+func tcpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err error) {
 	var listenerList []*net.TCPListener
 	defer func() {
 		if err != nil {
@@ -403,21 +420,32 @@ func tcpListenOnPort(addrs []*net.UDPAddr, port int) (fc frontendConnection, err
 	return &tcpFrontendConn{listenerList: listenerList}, nil
 }
 
-func listenKCP(conn net.PacketConn, info *ServerInfo, pass, salt []byte, delegToProxy bool) (*kcp.Listener, error) {
+func listenKCP(conn net.PacketConn, info *ServerInfo, delegToProxy bool) (*kcp.Listener, *rotatingCrypto, error) {
+	pass := make([]byte, 48)
+	if _, err := crypto_rand.Read(pass); err != nil {
+		return nil, nil, fmt.Errorf("rand pass failed: %v", err)
+	}
+	salt := make([]byte, 48)
+	if _, err := crypto_rand.Read(salt); err != nil {
+		return nil, nil, fmt.Errorf("rand salt failed: %v", err)
+	}
+
 	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0, delegToProxy)
 	if err != nil {
-		return nil, fmt.Errorf("new rotating crypto failed: %w", err)
+		return nil, nil, fmt.Errorf("new rotating crypto failed: %w", err)
 	}
 	block := kcp.NewAEADCrypt(crypto)
 
 	listener, err := kcp.ServeConn(block, 1, 1, conn)
 	if err != nil {
-		return nil, fmt.Errorf("kcp serve conn failed: %v", err)
+		return nil, nil, fmt.Errorf("kcp serve conn failed: %v", err)
 	}
 
 	info.Mode = kUdpModeKCP
+	info.Pass = fmt.Sprintf("%x", pass)
+	info.Salt = fmt.Sprintf("%x", salt)
 
-	return listener, nil
+	return listener, crypto, nil
 }
 
 func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listener, uint16, error) {
@@ -642,7 +670,7 @@ func handleKcpConn(args *tsshdArgs, proxy *serverProxy, conn *kcp.UDPSession) {
 		return
 	}
 
-	server := newSshUdpServer(args, proxy, conn.RemoteAddr(), &kcpServer{session, &udpForwarder{conn: newKcpDatagramConn(conn)}})
+	server := newSshUdpServer(args, proxy, conn.RemoteAddr(), &kcpServer{conn, session, &udpForwarder{conn: newKcpDatagramConn(conn)}})
 	if server == nil {
 		return
 	}
@@ -650,7 +678,7 @@ func handleKcpConn(args *tsshdArgs, proxy *serverProxy, conn *kcp.UDPSession) {
 	for {
 		stream, err := session.AcceptStream()
 		if err != nil {
-			if !isClosedError(err) {
+			if !IsClosedError(err) {
 				warning("kcp smux accept stream failed: %v", err)
 			}
 			return
@@ -691,7 +719,7 @@ func handleQuicConn(args *tsshdArgs, proxy *serverProxy, conn *quic.Conn, initia
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
-			if !isClosedError(err) {
+			if !IsClosedError(err) {
 				warning("quic accept stream failed: %v", err)
 			}
 			return

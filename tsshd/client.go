@@ -26,6 +26,8 @@ package tsshd
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -60,12 +62,14 @@ type agentRequest struct {
 type SshUdpClient struct {
 	proxyClient      *SshUdpClient
 	protoClient      protocolClient
+	protoVersion     int
 	clientProxy      *clientProxy
 	intervalTime     time.Duration
 	connectTimeout   time.Duration
 	exitWG           sync.WaitGroup
 	closed           atomic.Bool
 	quited           atomic.Bool
+	detached         atomic.Bool
 	busMutex         sync.Mutex
 	busStream        Stream
 	busClosed        chan struct{}
@@ -75,7 +79,7 @@ type SshUdpClient struct {
 	channelMutex     sync.Mutex
 	channelMap       map[string]chan ssh.NewChannel
 	quitCallback     func(string)
-	discardCallback  func([]byte)
+	discardCallback  func([]byte, uint64, uint64)
 	enableDebugging  bool
 	clientDebugFunc  func(int64, string)
 	enableWarning    bool
@@ -84,7 +88,8 @@ type SshUdpClient struct {
 	activeAckChan    chan int64
 	reconnectMutex   sync.Mutex
 	reconnectError   atomic.Pointer[error]
-	pendingClearPkt  atomic.Bool
+	maxHeartbeatCnt  atomic.Uint64
+	needLogHeartbeat atomic.Bool
 	keepPendingInput atomic.Bool
 }
 
@@ -105,24 +110,27 @@ type UdpClientOptions struct {
 	DebugFunc        func(int64, string)
 	WarningFunc      func(string)
 	QuitCallback     func(reason string)
-	DiscardCallback  func(discarded []byte)
+	DiscardCallback  func(discardedInput []byte, discardedOutputLines, discardedOutputBytes uint64)
 }
 
 // NewSshUdpClient creates a SshUdpClient
-func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
+func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error) {
 	enableDebugLogging, clientDebugFn = opts.EnableDebugging, opts.DebugFunc
 	enableWarningLogging, clientWarningFn = opts.EnableWarning, opts.WarningFunc
 
-	ver, err := parseTsshdVersion(opts.ServerInfo.ServerVer)
-	if err != nil {
-		return nil, fmt.Errorf("tsshd version invalid: %v", err)
-	}
-	if ver.compare(&tsshdVersion{0, 1, 6}) < 0 {
-		return nil, fmt.Errorf("please upgrade tsshd to continue")
+	if opts.ServerInfo.ProtoVer == 0 {
+		ver, err := parseTsshdVersion(opts.ServerInfo.ServerVer)
+		if err != nil {
+			return nil, fmt.Errorf("tsshd version invalid: %v", err)
+		}
+		if ver.compare(&tsshdVersion{0, 1, 6}) < 0 {
+			return nil, fmt.Errorf("please upgrade tsshd to continue")
+		}
 	}
 
-	udpClient := &SshUdpClient{
+	udpClient = &SshUdpClient{
 		proxyClient:     opts.ProxyClient,
+		protoVersion:    min(opts.ServerInfo.ProtoVer, kTsshdProtocol),
 		sessionMap:      make(map[uint64]*SshUdpSession),
 		channelMap:      make(map[string]chan ssh.NewChannel),
 		intervalTime:    opts.IntervalTime,
@@ -133,14 +141,22 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		clientDebugFunc: opts.DebugFunc,
 		enableWarning:   opts.EnableWarning,
 		clientWarningFn: opts.WarningFunc,
+		activeChecker:   newTimeoutChecker(opts.HeartbeatTimeout),
 	}
+	defer func() {
+		if err != nil {
+			_ = udpClient.Close()
+			udpClient = nil
+		}
+	}()
 
 	udpClient.clientProxy, err = startClientProxy(udpClient, opts)
 	if err != nil {
-		return nil, err
+		return
 	}
 	beginTime := time.Now()
-	if err := udpClient.clientProxy.renewTransportPath(opts.ProxyClient, opts.ConnectTimeout); err != nil {
+	err = udpClient.clientProxy.renewTransportPath(opts.ProxyClient, opts.ConnectTimeout)
+	if err != nil {
 		if opts.ConnectTimeout > 2*time.Second && time.Since(beginTime) > (opts.ConnectTimeout-time.Second) {
 			net := "UDP"
 			if opts.ServerInfo.ProxyMode == kProxyModeTCP {
@@ -150,18 +166,17 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 			if pos := strings.LastIndex(opts.TsshdAddr, ":"); pos >= 0 {
 				port = opts.TsshdAddr[pos+1:]
 			}
-			return nil, fmt.Errorf("%v\r\n%s", err, fmt.Sprintf(
+			err = fmt.Errorf("%v\r\n%s", err, fmt.Sprintf(
 				"\033[0;36mHint:\033[0m This may be caused by a firewall blocking the %s port (%s) that tsshd is listening on.", net, port))
 		}
-		return nil, err
+		return
 	}
 
-	udpClient.protoClient, err = newProtoClient(opts, udpClient.clientProxy, udpClient.clientProxy.remoteAddr)
+	udpClient.protoClient, err = newProtoClient(opts, udpClient)
 	if err != nil {
-		return nil, err
+		return
 	}
 
-	udpClient.activeChecker = newTimeoutChecker(opts.HeartbeatTimeout)
 	if udpClient.enableDebugging {
 		udpClient.activeChecker.onTimeout(func() {
 			since := time.Since(time.UnixMilli(udpClient.activeChecker.getAliveTime()))
@@ -170,40 +185,40 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		udpClient.activeChecker.onReconnected(func() {
 			since := time.Since(time.UnixMilli(udpClient.activeChecker.getAliveTime()))
 			udpClient.debug("transport resumed: since_last_activity=%v", since)
+			time.AfterFunc(10*time.Second, func() {
+				if !udpClient.activeChecker.isTimeout() {
+					udpClient.clientProxy.udpTraffic.recFlag.Store(false)
+				}
+			})
 		})
 	}
-	udpClient.activeChecker.onReconnected(func() {
-		// Mark packet cache for deferred clearing.
-		// The cache is NOT cleared immediately on reconnection because
-		// the transport may appear reconnected while still being unstable.
-		udpClient.pendingClearPkt.Store(true)
-	})
 	udpClient.activeChecker.onTimeout(udpClient.tryToReconnect)
 
-	busStream, err := doWithTimeout(func() (Stream, error) {
-		return udpClient.newStream("bus")
-	}, opts.ConnectTimeout)
+	busStream, err := doWithTimeout(func() (Stream, error) { return udpClient.newStream("bus") }, opts.ConnectTimeout)
 	if err != nil {
-		_ = udpClient.Close()
-		return nil, fmt.Errorf("new bus stream failed: %v", err)
+		err = fmt.Errorf("new bus stream failed: %v", err)
+		return
 	}
 
-	if err := sendMessage(busStream, busMessage{
+	err = sendMessage(busStream, busMessage{
 		ClientVer:        kTsshdVersion,
+		ProtoVer:         udpClient.protoVersion,
 		SessionName:      opts.SessionName,
 		AliveTimeout:     opts.AliveTimeout,
 		IntervalTime:     opts.IntervalTime,
-		HeartbeatTimeout: opts.HeartbeatTimeout}); err != nil {
+		HeartbeatTimeout: opts.HeartbeatTimeout})
+	if err != nil {
 		_ = busStream.Close()
-		_ = udpClient.Close()
-		return nil, fmt.Errorf("send bus message failed: %w", err)
+		err = fmt.Errorf("send bus message failed: %w", err)
+		return
 	}
 
 	var resp busResponse
-	if err := recvResponse(busStream, &resp); err != nil {
+	err = recvResponse(busStream, &resp)
+	if err != nil {
 		_ = busStream.Close()
-		_ = udpClient.Close()
-		return nil, fmt.Errorf("bus stream init failed: %v", err)
+		err = fmt.Errorf("bus stream init failed: %v", err)
+		return
 	}
 	udpClient.debug("bus response next session id: %d", resp.NextSessionID)
 	udpClient.sessionID.Store(resp.NextSessionID)
@@ -214,7 +229,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 	udpClient.activeAckChan = make(chan int64, 1)
 	go udpClient.keepAlive(opts.IntervalTime)
 
-	return udpClient, nil
+	return
 }
 
 func (c *SshUdpClient) debug(format string, a ...any) {
@@ -241,48 +256,71 @@ func (c *SshUdpClient) Wait() error {
 	return nil
 }
 
-// Close closes the client
-func (c *SshUdpClient) Close() error {
+// Close terminates the client and releases underlying resources.
+//
+// Close is a *destructive operation*: it attempts to stop the remote session,
+// notify the server to exit, and finally closes the underlying transport stream.
+func (c *SshUdpClient) Close() (err error) {
 	if !c.closed.CompareAndSwap(false, true) {
-		return nil
+		return
 	}
 
-	_, _ = doWithTimeout(func() (int, error) {
-		if c.busStream == nil {
+	if c.busStream != nil && !c.detached.Load() {
+		_, err = doWithTimeout(func() (int, error) {
+			if err := c.sendBusCommand("close"); err != nil {
+				c.debug("send cmd [close] failed: %v", err)
+			} else {
+				c.debug("send cmd [close] completed")
+			}
+			_ = c.busStream.CloseWrite()
+
+			select {
+			case <-c.busClosed:
+				c.debug("close bus stream completed")
+			case <-time.After(280 * time.Millisecond):
+				c.debug("close bus stream timeout")
+			}
+			_ = c.busStream.Close()
 			return 0, nil
-		}
+		}, 300*time.Millisecond)
+	}
 
-		if err := c.sendBusCommand("close"); err != nil {
-			c.debug("send cmd [close] failed: %v", err)
-		} else {
-			c.debug("send cmd [close] completed")
-		}
-		_ = c.busStream.CloseWrite()
+	if c.protoClient != nil && !c.detached.Load() {
+		_, err = doWithTimeout(func() (int, error) {
+			err := c.protoClient.closeClient()
+			if err != nil {
+				c.debug("close client failed: %v", err)
+			} else {
+				c.debug("close client completed")
+			}
+			return 0, err
+		}, 200*time.Millisecond)
+	}
 
-		select {
-		case <-c.busClosed:
-			c.debug("close bus stream completed")
-		case <-time.After(280 * time.Millisecond):
-			c.debug("close bus stream timeout")
-		}
-		_ = c.busStream.Close()
-		return 0, nil
-	}, 300*time.Millisecond)
+	if c.clientProxy != nil {
+		_ = c.clientProxy.Close()
+	}
 
-	_, err := doWithTimeout(func() (int, error) {
-		err := c.protoClient.closeClient()
-		if err != nil {
-			c.debug("close client failed: %v", err)
-		} else {
-			c.debug("close client completed")
-		}
-		return 0, err
-	}, 200*time.Millisecond)
+	if c.activeChecker != nil {
+		c.activeChecker.Close()
+	}
 
-	_ = c.clientProxy.Close()
-	c.activeChecker.Close()
+	return
+}
 
-	return err
+// Detach disconnects the client from the server while allowing the remote session
+// to continue running in the background.
+//
+// Detach is a *non-destructive operation*: it indicates that the client no longer
+// manages or tracks the remote session lifecycle.
+//
+// After Detach returns, subsequent calls to Close are safe and will NOT
+// terminate or interfere with the remote session.
+func (c *SshUdpClient) Detach() {
+	if !c.detached.CompareAndSwap(false, true) {
+		return
+	}
+	_ = c.Close()
 }
 
 // Abandon marks the client as closed without sending ANY signals to the server.
@@ -510,9 +548,23 @@ func (c *SshUdpClient) tryToReconnect() {
 	c.reconnectMutex.Lock()
 	defer c.reconnectMutex.Unlock()
 
+	// If UDP packets from the server are still being received,
+	// the heartbeat timeout may be caused by temporary traffic bursts,
+	// network congestion, or packet loss rather than an actual disconnect.
+	//
+	// Wait until server UDP packets actually time out.
+	// If the heartbeat is still timed out by then, initiate a reconnection.
+	for !c.clientProxy.serverChecker.isTimeout() {
+		if !c.activeChecker.isTimeout() {
+			c.debug("heartbeat timeout was transient, reconnect canceled")
+			return
+		}
+		time.Sleep(min(c.intervalTime, 1*time.Second))
+	}
+
 	if c.proxyClient != nil {
 		// prioritize allowing the proxy to reconnect first
-		time.Sleep(c.proxyClient.intervalTime)
+		time.Sleep(min(c.proxyClient.intervalTime, 1*time.Second))
 
 		// wait for the proxy to reconnect first
 		if c.proxyClient.activeChecker.isTimeout() {
@@ -525,13 +577,22 @@ func (c *SshUdpClient) tryToReconnect() {
 
 	for c.activeChecker.isTimeout() && !c.IsClosed() {
 		c.debug("attempting new transport path")
+
+		if c.enableDebugging {
+			if !c.clientProxy.udpTraffic.recFlag.Load() {
+				c.clientProxy.clearBackendConn(nil)
+				c.clientProxy.udpTraffic.resetStats()
+				c.clientProxy.udpTraffic.recFlag.Store(true)
+			}
+		}
+
 		if err := c.clientProxy.renewTransportPath(c.proxyClient, c.connectTimeout); err != nil {
 			if c.IsClosed() {
 				return
 			}
 			c.debug("reconnect failed: %v", err)
 			c.reconnectError.Store(&err)
-			time.Sleep(c.intervalTime) // don't reconnect too frequently
+			time.Sleep(min(c.intervalTime, 10*time.Second)) // don't reconnect too frequently
 			continue
 		}
 
@@ -541,7 +602,7 @@ func (c *SshUdpClient) tryToReconnect() {
 		// After a successful reconnection, activeChecker.isTimeout() does not immediately become false.
 		// We wait here until the heartbeat normalizes (activeChecker.isTimeout() == false).
 		for {
-			time.Sleep(c.intervalTime)
+			time.Sleep(min(c.intervalTime, 1*time.Second))
 			if !c.activeChecker.isTimeout() {
 				return
 			}
@@ -555,9 +616,16 @@ func (c *SshUdpClient) tryToReconnect() {
 }
 
 func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
-	var serverAliveTime aliveTime
 	ticker := time.NewTicker(intervalTime)
 	defer ticker.Stop()
+
+	heartbeatCount := kHeartbeatInitCount
+	c.maxHeartbeatCnt.Add(kHeartbeatLogLimit)
+	client := c.proxyClient
+	for client != nil {
+		client.maxHeartbeatCnt.Add(kHeartbeatLogLimit / 2)
+		client = client.proxyClient
+	}
 
 	for range ticker.C {
 		if c.IsClosed() {
@@ -566,9 +634,9 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 
 		aliveTime := time.Now().UnixMilli()
 		if c.enableDebugging {
-			timeout, stabilizing := c.activeChecker.isTimeout(), c.pendingClearPkt.Load()
-			if timeout || stabilizing {
-				c.debug("keep alive [%d] sending: timeout=%v, stabilizing=%v", aliveTime, timeout, stabilizing)
+			timeout := c.activeChecker.isTimeout()
+			if timeout || heartbeatCount <= c.maxHeartbeatCnt.Load() || c.needLogHeartbeat.Load() {
+				c.debug("keep alive [%d] sending: timeout=%v, heartbeat=%d", aliveTime, timeout, heartbeatCount)
 			}
 		}
 
@@ -581,26 +649,35 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 		ackTime := <-c.activeAckChan
 
 		if c.enableDebugging {
-			timeout, stabilizing, rtt := c.activeChecker.isTimeout(), c.pendingClearPkt.Load(), time.Since(time.UnixMilli(ackTime))
-			if timeout || stabilizing || rtt > (2*intervalTime) {
-				c.debug("keep alive [%d] confirmed: timeout=%v, stabilizing=%v, rtt=%v", ackTime, timeout, stabilizing, rtt)
+			timeout := c.activeChecker.isTimeout()
+			rtt := time.Since(time.UnixMilli(ackTime))
+
+			// If the RTT exceeds heartbeatTimeout, it indicates that
+			// the client was previously disconnected and has now reconnected.
+			if rtt > c.activeChecker.heartbeatTimeout {
+				heartbeatCount = 0
+				// When the local client requires logging, force all proxies in the chain to log as well.
+				client := c.proxyClient
+				for client != nil {
+					client.needLogHeartbeat.Store(true)
+					client = client.proxyClient
+				}
 			}
+
+			if timeout || heartbeatCount <= c.maxHeartbeatCnt.Load() || rtt > (2*intervalTime) || c.needLogHeartbeat.Load() {
+				c.debug("keep alive [%d] confirmed: timeout=%v, heartbeat=%d, rtt=%v", ackTime, timeout, heartbeatCount, rtt)
+			} else {
+				// The local client no longer needs to log, so disable forced logging for all proxies in the chain.
+				client := c.proxyClient
+				for client != nil {
+					client.needLogHeartbeat.Store(false)
+					client = client.proxyClient
+				}
+			}
+			heartbeatCount++
 		}
 
 		c.activeChecker.updateTime(ackTime)
-
-		if c.pendingClearPkt.Load() {
-			serverAliveTime.addMilli(ackTime)
-			// If the server has remained active for a sufficient number of intervals,
-			// consider the connection stable and clear the packet cache.
-			if time.Since(time.UnixMilli(serverAliveTime.oldest())) < time.Duration(kAliveTimeCap+1)*intervalTime {
-				totalSize, totalCount := c.clientProxy.pktCache.clearCache()
-				if c.enableDebugging && (totalSize > 0 || totalCount > 0) {
-					c.debug("drop packet cache count [%d] size [%d]", totalCount, totalSize)
-				}
-				c.pendingClearPkt.Store(false)
-			}
-		}
 	}
 }
 
@@ -611,12 +688,18 @@ func (c *SshUdpClient) isBusStreamInited() bool {
 }
 
 func (c *SshUdpClient) sendBusCommand(command string) error {
+	if c.detached.Load() {
+		return nil
+	}
 	c.busMutex.Lock()
 	defer c.busMutex.Unlock()
 	return sendCommand(c.busStream, command)
 }
 
 func (c *SshUdpClient) sendBusMessage(command string, msg any) error {
+	if c.detached.Load() {
+		return nil
+	}
 	c.busMutex.Lock()
 	defer c.busMutex.Unlock()
 	return sendCommandAndMessage(c.busStream, command, msg)
@@ -755,15 +838,15 @@ func (c *SshUdpClient) handleDiscardEvent() {
 		return
 	}
 
-	if len(msg.DiscardedInput) > 0 && c.discardCallback != nil {
-		go c.discardCallback(msg.DiscardedInput)
+	if c.discardCallback != nil && (len(msg.DiscardedInput) > 0 || msg.DiscardedOutputLines > 0 || msg.DiscardedOutputBytes > 0) {
+		go c.discardCallback(msg.DiscardedInput, msg.DiscardedOutputLines, msg.DiscardedOutputBytes)
 	}
 
 	if len(msg.DiscardMarker) > 0 {
 		c.sessionMutex.Lock()
 		defer c.sessionMutex.Unlock()
 		for _, sess := range c.sessionMap {
-			sess.discardMarker.Store(&msg.DiscardMarker)
+			sess.inputMarker.Store(&msg.DiscardMarker)
 		}
 	}
 }
@@ -785,23 +868,25 @@ func (c *SshUdpClient) handleRekeyEvent() {
 
 // SshUdpSession represents a connection to a remote command or shell
 type SshUdpSession struct {
-	id            uint64
-	exitWG        sync.WaitGroup
-	client        *SshUdpClient
-	stream        Stream
-	pty           bool
-	height        int
-	width         int
-	envs          map[string]string
-	started       bool
-	closed        atomic.Bool
-	stdin         *io.PipeReader
-	stdout        *io.PipeWriter
-	stderr        *io.PipeWriter
-	code          int
-	x11           *x11Request
-	agent         *agentRequest
-	discardMarker atomic.Pointer[[]byte]
+	id           uint64
+	exitWG       sync.WaitGroup
+	client       *SshUdpClient
+	stream       Stream
+	pty          bool
+	height       int
+	width        int
+	envs         map[string]string
+	started      bool
+	closed       atomic.Bool
+	stdin        *io.PipeReader
+	stdout       *io.PipeWriter
+	stderr       *io.PipeWriter
+	code         int
+	x11          *x11Request
+	agent        *agentRequest
+	inputMarker  atomic.Pointer[[]byte]
+	outForwarder *clientOutputForwarder
+	errForwarder *clientOutputForwarder
 }
 
 // Wait waits for the remote command to exit
@@ -813,6 +898,10 @@ func (s *SshUdpSession) Wait() error {
 // Close closes the underlying network connection
 func (s *SshUdpSession) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	if s.client.detached.Load() {
 		return nil
 	}
 
@@ -932,7 +1021,8 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 		go s.forwardInput()
 	}
 	if s.stdout != nil {
-		s.exitWG.Go(func() { s.forwardOutput("stdout", s.stream, s.stdout) })
+		s.outForwarder = s.newOutputForwarder("stdout", s.stream, s.stdout)
+		s.exitWG.Go(func() { s.outForwarder.forward() })
 	}
 	return nil
 }
@@ -941,8 +1031,11 @@ func (s *SshUdpSession) forwardInput() {
 	defer func() {
 		s.client.debug("session [%d] stdin completed", s.id)
 		_ = s.stdin.Close()
-		if err := s.stream.CloseWrite(); err != nil {
-			s.client.debug("session [%d] close write failed: %v", s.id, err)
+
+		if !s.client.detached.Load() {
+			if err := s.stream.CloseWrite(); err != nil {
+				s.client.debug("session [%d] close write failed: %v", s.id, err)
+			}
 		}
 	}()
 
@@ -965,13 +1058,13 @@ func (s *SshUdpSession) forwardInput() {
 					if s.client.discardCallback != nil {
 						// Currently in timeout; no need for asynchronous call,
 						// so call the discard callback synchronously without copying the buffer
-						s.client.discardCallback(buf)
+						s.client.discardCallback(buf, 0, 0)
 					}
 					continue
 				}
 			}
 
-			if marker := s.discardMarker.Swap(nil); marker != nil {
+			if marker := s.inputMarker.Swap(nil); marker != nil {
 				if err := writeAll(s.stream, *marker); err != nil {
 					return
 				}
@@ -987,24 +1080,14 @@ func (s *SshUdpSession) forwardInput() {
 	}
 }
 
-func (s *SshUdpSession) forwardOutput(name string, reader Stream, writer *io.PipeWriter) {
-	defer func() {
-		_ = writer.Close()
-		_ = reader.CloseRead()
-	}()
-	buffer := make([]byte, 32*1024)
-	for {
-		n, err := reader.Read(buffer)
-		if n > 0 {
-			if err := writeAll(writer, buffer[:n]); err != nil {
-				break
-			}
-		}
-		if err != nil {
-			break
-		}
+func (s *SshUdpSession) newOutputForwarder(name string, reader Stream, writer *io.PipeWriter) *clientOutputForwarder {
+	return &clientOutputForwarder{
+		name:   name,
+		sess:   s,
+		client: s.client,
+		reader: reader,
+		writer: writer,
 	}
-	s.client.debug("session [%d] %s completed", s.id, name)
 }
 
 func (s *SshUdpSession) exit(code int) {
@@ -1072,7 +1155,8 @@ func (s *SshUdpSession) StderrPipe() (io.Reader, error) {
 	}
 	reader, writer := io.Pipe()
 	s.stderr = writer
-	s.exitWG.Go(func() { s.forwardOutput("stderr", stream, s.stderr) })
+	s.errForwarder = s.newOutputForwarder("stderr", stream, s.stderr)
+	s.exitWG.Go(func() { s.errForwarder.forward() })
 	return reader, nil
 }
 
@@ -1165,19 +1249,47 @@ func (s *SshUdpSession) RequestSubsystem(name string) error {
 	return s.startSession(&msg)
 }
 
-// RedrawScreen clear and redraw the screen right now
-func (s *SshUdpSession) RedrawScreen() {
+// RedrawScreen forces the terminal application to repaint the screen.
+// If discardPreviousOutput is true, any buffered output generated before
+// the redraw will be discarded so that only the refreshed screen state
+// is sent to the client.
+func (s *SshUdpSession) RedrawScreen(discardPreviousOutput bool) error {
 	if s.height <= 0 || s.width <= 0 {
-		return
+		return fmt.Errorf("invalid terminal size: width=%d height=%d", s.width, s.height)
 	}
+
+	var marker []byte
+	if discardPreviousOutput && s.client.protoVersion >= 1 {
+		// The marker should not contain '\n' or '\r'.
+		// Otherwise it may be split by the server's output caching logic,
+		// causing part of the marker to be sent while the remaining bytes
+		// are discarded together with cached output.
+		bytes := make([]byte, 30)
+		if _, err := rand.Read(bytes); err != nil {
+			return fmt.Errorf("generate discard marker failed: %v", err)
+		}
+		marker = fmt.Appendf(nil, "[TSSHD-MARKER-%s]", base64.StdEncoding.EncodeToString(bytes))
+		s.client.debug("discard previous output marker: %s", string(marker))
+
+		if s.outForwarder != nil {
+			s.outForwarder.marker.Store(&marker)
+		}
+		if s.errForwarder != nil {
+			s.errForwarder.marker.Store(&marker)
+		}
+	}
+
 	if err := s.client.sendBusMessage("resize", resizeMessage{
 		ID:     s.id,
 		Cols:   s.width,
 		Rows:   s.height,
 		Redraw: true,
+		Marker: marker,
 	}); err != nil {
-		s.client.warning("send redraw message failed: %v", err)
+		return fmt.Errorf("send redraw message failed: %v", err)
 	}
+
+	return nil
 }
 
 // GetTerminalWidth returns the width of the terminal

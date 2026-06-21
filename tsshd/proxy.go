@@ -31,7 +31,8 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -83,7 +84,17 @@ func sendUdpPacket(conn io.Writer, data []byte) error {
 	buf := make([]byte, 2+len(data))
 	binary.BigEndian.PutUint16(buf, uint16(len(data)))
 	copy(buf[2:], data)
-	return writeAll(conn, buf)
+	// Packet writes must be issued as a single Write call.
+	// Retrying partial writes could interleave packets when
+	// multiple goroutines send cached packets concurrently.
+	n, err := conn.Write(buf)
+	if err != nil {
+		return err
+	}
+	if n != len(buf) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func recvUdpPacket(conn io.Reader, data []byte) (int, error) {
@@ -101,116 +112,36 @@ func recvUdpPacket(conn io.Reader, data []byte) (int, error) {
 	return n, nil
 }
 
-const kSampleCacheSize = 10
-const kPacketCacheSize = 100
-
-type packetCache struct {
-	mutex      sync.Mutex
-	firstBuf   [][]byte
-	recentBuf  [][]byte
-	recentIdx  int
-	totalSize  int
-	totalCount int
-	sampleIdx  int
-	sampleBuf  [kSampleCacheSize][]byte
+type trafficStats struct {
+	recFlag   atomic.Bool
+	sendCount atomic.Uint64
+	sendBytes atomic.Uint64
+	recvCount atomic.Uint64
+	recvBytes atomic.Uint64
+	lastMilli atomic.Int64
 }
 
-func (p *packetCache) addSample(buf []byte) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	data := make([]byte, len(buf))
-	copy(data, buf)
-
-	p.sampleBuf[p.sampleIdx] = data
-	p.sampleIdx = p.sampleIdx + 1
-	if p.sampleIdx >= kSampleCacheSize {
-		p.sampleIdx = 0
-	}
+func (s *trafficStats) resetStats() {
+	s.sendCount.Store(0)
+	s.sendBytes.Store(0)
+	s.recvCount.Store(0)
+	s.recvBytes.Store(0)
+	s.lastMilli.Store(time.Now().UnixMilli())
 }
 
-func (p *packetCache) addPacket(buf []byte) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
+func (s *trafficStats) flushLog() string {
+	sc := s.sendCount.Swap(0)
+	sb := s.sendBytes.Swap(0)
+	rc := s.recvCount.Swap(0)
+	rb := s.recvBytes.Swap(0)
 
-	p.totalSize += len(buf)
-	p.totalCount++
-
-	data := make([]byte, len(buf))
-	copy(data, buf)
-
-	if len(p.firstBuf) < kPacketCacheSize {
-		if p.firstBuf == nil {
-			p.firstBuf = make([][]byte, 0, kPacketCacheSize)
-		}
-		p.firstBuf = append(p.firstBuf, data)
-		return
+	if sc == 0 && rc == 0 {
+		s.lastMilli.Store(time.Now().UnixMilli())
+		return ""
 	}
 
-	if len(p.recentBuf) < kPacketCacheSize {
-		if p.recentBuf == nil {
-			p.recentBuf = make([][]byte, 0, kPacketCacheSize)
-		}
-		p.recentBuf = append(p.recentBuf, data)
-		return
-	}
+	now := time.Now().UnixMilli()
+	last := s.lastMilli.Swap(now)
 
-	p.recentBuf[p.recentIdx] = data
-	p.recentIdx = p.recentIdx + 1
-	if p.recentIdx >= kPacketCacheSize {
-		p.recentIdx = 0
-	}
-}
-
-func (p *packetCache) sendCache(writeFn func([]byte) error) (flushSize, flushCount int) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	var once sync.Once
-
-	for i := range kSampleCacheSize {
-		buf := p.sampleBuf[(p.sampleIdx+i)%kSampleCacheSize]
-		if len(buf) == 0 {
-			continue
-		}
-		if err := writeFn(buf); err != nil {
-			once.Do(func() { debug("send cache failed: %v", err) })
-		}
-		flushSize += len(buf)
-		flushCount++
-	}
-
-	for _, buf := range p.firstBuf {
-		if err := writeFn(buf); err != nil {
-			once.Do(func() { debug("send cache failed: %v", err) })
-		}
-		flushSize += len(buf)
-		flushCount++
-	}
-
-	for i := range len(p.recentBuf) {
-		buf := p.recentBuf[(p.recentIdx+i)%kPacketCacheSize]
-		if err := writeFn(buf); err != nil {
-			once.Do(func() { debug("send cache failed: %v", err) })
-		}
-		flushSize += len(buf)
-		flushCount++
-	}
-
-	return flushSize, flushCount
-}
-
-func (p *packetCache) clearCache() (totalSize, totalCount int) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	for i := range kSampleCacheSize {
-		p.sampleBuf[i] = nil
-	}
-
-	p.firstBuf, p.recentBuf, p.recentIdx = nil, nil, 0
-
-	totalSize, totalCount = p.totalSize, p.totalCount
-	p.totalSize, p.totalCount = 0, 0
-	return
+	return fmt.Sprintf("udp traffic: duration=%dms, send=%d(%dB), recv=%d(%dB)", now-last, sc, sb, rc, rb)
 }

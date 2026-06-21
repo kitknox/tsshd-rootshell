@@ -313,10 +313,10 @@ func RunMain(opts ...Option) (int, error) {
 
 	addOnExitFunc(func() {
 		if server := activeSshUdpServer.Load(); server != nil {
-			server.Close()
+			_, _ = doWithTimeout(func() (int, error) { server.Close(); return 0, nil }, time.Second)
 			// If the client is still active on exit, logs have likely been delivered,
 			// so the server-side debug log can be cleaned up.
-			if enableDebugLogging && !server.clientChecker.isTimeout() {
+			if enableDebugLogging && server.isClientAlive() {
 				cleanupDebugLog.Store(true)
 			}
 		}
@@ -362,7 +362,7 @@ func monitorServerLiveness(args *tsshdArgs) {
 		}
 
 		// Check the last received client heartbeat. Exit if it exceeds aliveTimeout.
-		if time.Since(time.UnixMilli(server.clientAliveTime.latest())) > server.aliveTimeout {
+		if time.Since(time.UnixMilli(server.clientAliveTime.Load())) > server.aliveTimeout {
 			warning("tsshd keep alive timeout")
 			exitWithCode(kExitCodeAliveTimeout)
 			return

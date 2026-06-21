@@ -37,9 +37,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/quic-go/quic-go"
+	"github.com/trzsz/kcp-go/v5"
+	"github.com/trzsz/quic-go"
 	"github.com/trzsz/smux"
-	"github.com/xtaci/kcp-go/v5"
 )
 
 const kNoErrorMsg = "_TSSHD_NO_ERROR_"
@@ -83,6 +83,7 @@ func (e *Error) Error() string {
 // ServerInfo includes all information used for client login
 type ServerInfo struct {
 	ServerVer  string `json:",omitempty"`
+	ProtoVer   int    `json:",omitempty"`
 	Port       int    `json:",omitempty"`
 	Mode       string `json:",omitempty"`
 	Pass       string `json:",omitempty"`
@@ -125,6 +126,7 @@ type debugMessage struct {
 
 type busMessage struct {
 	ClientVer        string        `json:",omitempty"`
+	ProtoVer         int           `json:",omitempty"`
 	AliveTimeout     time.Duration `json:",omitempty"`
 	IntervalTime     time.Duration `json:",omitempty"`
 	HeartbeatTimeout time.Duration `json:",omitempty"`
@@ -186,6 +188,7 @@ type resizeMessage struct {
 	Cols   int    `json:",omitempty"`
 	Rows   int    `json:",omitempty"`
 	Redraw bool   `json:",omitempty"`
+	Marker []byte `json:",omitempty"`
 }
 
 type stderrMessage struct {
@@ -249,8 +252,10 @@ type udpReadyMessage struct {
 }
 
 type discardMessage struct {
-	DiscardMarker  []byte `json:",omitempty"`
-	DiscardedInput []byte `json:",omitempty"`
+	DiscardMarker        []byte `json:",omitempty"`
+	DiscardedInput       []byte `json:",omitempty"`
+	DiscardedOutputLines uint64 `json:",omitempty"`
+	DiscardedOutputBytes uint64 `json:",omitempty"`
 }
 
 type settingsMessage struct {
@@ -414,6 +419,7 @@ func recvResponse(stream Stream, resp errorResponder) error {
 }
 
 type protocolClient interface {
+	reset()
 	closeClient() error
 	getUdpForwarder() *udpForwarder
 	newStream(connectTimeout time.Duration) (Stream, error)
@@ -423,6 +429,10 @@ type kcpClient struct {
 	conn      *kcp.UDPSession
 	session   *smux.Session
 	forwarder *udpForwarder
+}
+
+func (c *kcpClient) reset() {
+	c.conn.ResetRTO()
 }
 
 func (c *kcpClient) closeClient() error {
@@ -447,6 +457,10 @@ type quicClient struct {
 	forwarder *udpForwarder
 }
 
+func (c *quicClient) reset() {
+	c.conn.ResetPTO()
+}
+
 func (c *quicClient) closeClient() error {
 	c.forwarder.Close()
 	return c.conn.CloseWithError(0, "")
@@ -466,23 +480,35 @@ func (c *quicClient) newStream(connectTimeout time.Duration) (Stream, error) {
 	return &quicStream{stream, c.conn}, err
 }
 
-func newProtoClient(opts *UdpClientOptions, proxy *clientProxy, remoteAddr net.Addr) (protocolClient, error) {
+func newProtoClient(opts *UdpClientOptions, client *SshUdpClient) (protocolClient, error) {
 	switch opts.ServerInfo.Mode {
 	case "":
 		return nil, fmt.Errorf("%s", "Please upgrade tsshd")
 	case kUdpModeKCP:
-		return newKcpClient(opts, proxy, remoteAddr, proxy.kcpCrypto.keyPass, proxy.kcpCrypto.keySalt, true)
+		return newKcpClient(opts, client, client.clientProxy, client.clientProxy.remoteAddr)
 	case kUdpModeQUIC:
-		return newQuicClient(opts, proxy, remoteAddr)
+		return newQuicClient(opts, client.clientProxy, client.clientProxy.remoteAddr)
 	default:
 		return nil, fmt.Errorf("unknown tsshd mode: %s", opts.ServerInfo.Mode)
 	}
 }
 
-func newKcpClient(opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr net.Addr, pass, salt []byte, delegToProxy bool) (*kcpClient, error) {
-	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0, delegToProxy)
+func newKcpClient(opts *UdpClientOptions, client *SshUdpClient, udpConn net.PacketConn, remoteAddr net.Addr) (*kcpClient, error) {
+	pass, err := hex.DecodeString(opts.ServerInfo.Pass)
+	if err != nil {
+		return nil, fmt.Errorf("decode pass [%s] failed: %w", opts.ServerInfo.Pass, err)
+	}
+	salt, err := hex.DecodeString(opts.ServerInfo.Salt)
+	if err != nil {
+		return nil, fmt.Errorf("decode salt [%s] failed: %w", opts.ServerInfo.Pass, err)
+	}
+
+	crypto, err := newRotatingCrypto(client, pass, salt, kRekeyBytesThreshold, kRekeyTimeThreshold, false)
 	if err != nil {
 		return nil, fmt.Errorf("new rotating crypto failed: %w", err)
+	}
+	if client != nil {
+		client.clientProxy.kcpCrypto = crypto
 	}
 	block := kcp.NewAEADCrypt(crypto)
 
