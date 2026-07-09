@@ -218,17 +218,18 @@ func (f *udpForwarder) Close() {
 // packetConn implements PacketConn over either QUIC datagrams (unordered)
 // or a reliable stream fallback. Read and Consume are mutually exclusive.
 type packetConn struct {
-	stream     Stream
-	forwarder  *udpForwarder
-	peerCheck  *timeoutChecker
-	readMutex  sync.Mutex
-	readerOnce sync.Once
-	channelID  uint64
-	channelCh  chan []byte
-	streamCh   chan []byte
-	consumeFn  atomic.Pointer[func([]byte) error]
-	closed     atomic.Bool
-	closeCh    chan struct{}
+	stream       Stream
+	forwarder    *udpForwarder
+	peerCheck    *timeoutChecker
+	readMutex    sync.Mutex
+	readerOnce   sync.Once
+	channelID    uint64
+	channelCh    chan []byte
+	streamCh     chan []byte
+	consumeFn    atomic.Pointer[func([]byte) error]
+	closed       atomic.Bool
+	closeCh      chan struct{}
+	datagramOnly bool
 }
 
 func newPacketConn(stream Stream, id uint64, forwarder *udpForwarder, peerCheck *timeoutChecker) *packetConn {
@@ -335,6 +336,21 @@ func (c *packetConn) startStreamReader() {
 }
 
 func (c *packetConn) Write(buf []byte) error {
+	if c.datagramOnly {
+		// Real-UDP semantics: drop instead of blocking on reconnection or
+		// falling back to the reliable stream, so the inner protocol's path
+		// MTU discovery observes genuine losses and converges below the
+		// datagram budget. Only a closed forwarder is a hard error.
+		if c.forwarder == nil || c.forwarder.closed.Load() {
+			return io.ErrClosedPipe
+		}
+		if c.peerCheck.isTimeout() {
+			return nil
+		}
+		_ = c.forwarder.sendDatagram(c.channelID, buf)
+		return nil
+	}
+
 	if c.peerCheck.isTimeout() {
 		if err := c.peerCheck.waitUntilReconnected(); err != nil {
 			return err
