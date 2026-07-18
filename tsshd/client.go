@@ -525,6 +525,20 @@ func (c *SshUdpClient) GetLastActiveTime() int64 {
 	return c.activeChecker.getAliveTime()
 }
 
+// OnHealthEvent registers callbacks fired when the heartbeat checker
+// transitions into the timeout state (no alive ack within the heartbeat
+// timeout) or recovers from it. Callbacks run on dedicated goroutines and
+// may block briefly. Registration is append-only; register each listener
+// at most once per client.
+func (c *SshUdpClient) OnHealthEvent(onTimeout, onReconnected func()) {
+	if onTimeout != nil {
+		c.activeChecker.onTimeout(onTimeout)
+	}
+	if onReconnected != nil {
+		c.activeChecker.onReconnected(onReconnected)
+	}
+}
+
 // GetLastReconnectError returns the last error encountered during reconnection attempts
 func (c *SshUdpClient) GetLastReconnectError() error {
 	client := c
