@@ -423,6 +423,7 @@ type protocolClient interface {
 	closeClient() error
 	getUdpForwarder() *udpForwarder
 	newStream(connectTimeout time.Duration) (Stream, error)
+	stats(s *TransportStats)
 }
 
 type kcpClient struct {
