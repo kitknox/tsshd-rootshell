@@ -2,6 +2,8 @@ module github.com/trzsz/tsshd
 
 go 1.25.0
 
+replace github.com/trzsz/kcp-go/v5 => github.com/kitknox/kcp-go-rootshell/v5 v5.0.0-20260718202214-2a3b09b878fb
+
 require (
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/UserExistsError/conpty v0.1.4

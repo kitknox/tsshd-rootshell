@@ -1,3 +1,18 @@
+# tsshd — rootshell fork
+
+This repository is the [rootshell](https://www.rootshell.com)-maintained fork
+of [trzsz/tsshd](https://github.com/trzsz/tsshd). It adds transport lifecycle,
+health and statistics reporting, and datagram-forwarding support used by
+rootshell's `tssh` integration. The fork is maintained independently and does
+not automatically track subsequent upstream changes.
+
+The `tsshd` command name and Go module path remain unchanged. Report rootshell
+application problems in the
+[rootshell issue tracker](https://github.com/kitknox/rootshell/issues); report
+reproducible upstream `tsshd` problems to the upstream project.
+
+---
+
 ## tsshd: UDP-based SSH Server with Seamless Roaming and Auto-Reconnect
 
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg?style=flat)](https://choosealicense.com/licenses/mit/)
