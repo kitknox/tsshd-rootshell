@@ -1013,6 +1013,8 @@ func (s *SshUdpSession) Start(cmd string) error {
 		ID:    s.id,
 		Pty:   s.pty,
 		Shell: false,
+		Cols:  s.width,
+		Rows:  s.height,
 		Name:  args[0],
 		Args:  args[1:],
 		Envs:  s.envs,
