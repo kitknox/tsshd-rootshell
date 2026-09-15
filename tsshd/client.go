@@ -333,6 +333,25 @@ func (c *SshUdpClient) Abandon() {
 	// Intentionally do nothing else.
 }
 
+// ExitSession asks the server to close the session with the given ID, whether
+// or not this client owns it. Auxiliary sessions a client opens alongside its
+// own (exec channels for a control stream, for example) are never reattached,
+// so on an attachable server a client that died abruptly leaves them running
+// with nothing reading their output. A later run reaps them by ID with this.
+//
+// The server has routed the "exit" bus command to closeSession since long
+// before this method existed, so no server-side change is needed.
+func (c *SshUdpClient) ExitSession(id uint64) error {
+	if c.closed.Load() {
+		return fmt.Errorf("client is closed")
+	}
+	if err := c.sendBusMessage("exit", exitMessage{ID: id}); err != nil {
+		return fmt.Errorf("exit session [%d] failed: %w", id, err)
+	}
+	c.debug("requested exit of session [%d]", id)
+	return nil
+}
+
 func (c *SshUdpClient) newStream(cmd string) (Stream, error) {
 	stream, err := c.protoClient.newStream(c.connectTimeout)
 	if err != nil {
