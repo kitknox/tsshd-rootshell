@@ -32,6 +32,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -83,7 +84,7 @@ func runStreamEchoTest(t *testing.T, stream Stream) {
 	}
 }
 
-func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
+func runProxyEchoTest(t *testing.T, args *tsshdArgs, customize ...func(*UdpClientOptions)) {
 	oriNew := newSshUdpServer
 	defer func() {
 		newSshUdpServer = oriNew
@@ -110,6 +111,9 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 		ServerInfo:       &info,
 		ConnectTimeout:   args.ConnectTimeout,
 		HeartbeatTimeout: 3 * time.Second,
+	}
+	for _, fn := range customize {
+		fn(opts)
 	}
 
 	clientCount := 1
@@ -203,6 +207,58 @@ func TestProxy(t *testing.T) {
 
 				runProxyEchoTest(t, args)
 			})
+		})
+	}
+}
+
+func TestProxyDialHooks(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		kcp  bool
+		tcp  bool
+	}{
+		{"QUIC", false, false},
+		{"QUIC_TCP", false, true},
+		{"KCP", true, false},
+		{"KCP_TCP", true, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			args := &tsshdArgs{KCP: tt.kcp, TCP: tt.tcp, Port: "31000-65000", ConnectTimeout: 3 * time.Second}
+			var dials atomic.Int32
+			dial := func(network, addr string, timeout time.Duration) (net.Conn, error) {
+				dials.Add(1)
+				return net.DialTimeout(network, addr, timeout)
+			}
+			runProxyEchoTest(t, args, func(opts *UdpClientOptions) {
+				opts.DialTCP, opts.DialUDP, opts.MaxPacketSize = dial, dial, 1200
+			})
+			// Initial path plus the renewal.
+			if got := dials.Load(); got != 2 {
+				t.Fatalf("dial hook calls = %d, want 2", got)
+			}
+		})
+	}
+}
+
+func TestProxyDialHooksFallBack(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		tcp  bool
+	}{{"UDP", false}, {"TCP", true}} {
+		t.Run(tt.name, func(t *testing.T) {
+			args := &tsshdArgs{TCP: tt.tcp, Port: "31000-65000", ConnectTimeout: 3 * time.Second}
+			var asked atomic.Int32
+			decline := func(string, string, time.Duration) (net.Conn, error) {
+				asked.Add(1)
+				return nil, nil
+			}
+			runProxyEchoTest(t, args, func(opts *UdpClientOptions) {
+				opts.DialTCP, opts.DialUDP = decline, decline
+			})
+			// Asked on every path renewal, then the OS dial carried it.
+			if got := asked.Load(); got != 2 {
+				t.Fatalf("hook calls = %d, want 2", got)
+			}
 		})
 	}
 }

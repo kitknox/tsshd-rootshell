@@ -111,6 +111,13 @@ type UdpClientOptions struct {
 	WarningFunc      func(string)
 	QuitCallback     func(reason string)
 	DiscardCallback  func(discardedInput []byte, discardedOutputLines, discardedOutputBytes uint64)
+	// DialTCP and DialUDP, when set, run before each OS dial to TsshdAddr (e.g. for a userspace
+	// network); a nil conn with a nil error falls back to the OS dial. DialUDP must return a
+	// connection that preserves datagram boundaries.
+	DialTCP func(network, addr string, timeout time.Duration) (net.Conn, error)
+	DialUDP func(network, addr string, timeout time.Duration) (net.Conn, error)
+	// MaxPacketSize caps KCP/QUIC packets when the server sends no MTU; 0 keeps the default.
+	MaxPacketSize uint16
 }
 
 // NewSshUdpClient creates a SshUdpClient

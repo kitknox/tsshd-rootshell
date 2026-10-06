@@ -523,6 +523,8 @@ func newKcpClient(opts *UdpClientOptions, client *SshUdpClient, udpConn net.Pack
 
 	if opts.ServerInfo.MTU != 0 {
 		conn.SetMtu(int(opts.ServerInfo.MTU))
+	} else if opts.MaxPacketSize != 0 {
+		conn.SetMtu(int(opts.MaxPacketSize))
 	} else if opts.ProxyClient != nil {
 		conn.SetMtu(int(opts.ProxyClient.GetMaxDatagramSize()))
 	} else {
@@ -565,6 +567,9 @@ func newQuicClient(opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr ne
 	config := quicConfig
 	if opts.ServerInfo.MTU != 0 {
 		config.InitialPacketSize = opts.ServerInfo.MTU
+		config.DisablePathMTUDiscovery = true
+	} else if opts.MaxPacketSize != 0 {
+		config.InitialPacketSize = opts.MaxPacketSize
 		config.DisablePathMTUDiscovery = true
 	} else if opts.ProxyClient != nil {
 		config.InitialPacketSize = opts.ProxyClient.GetMaxDatagramSize()

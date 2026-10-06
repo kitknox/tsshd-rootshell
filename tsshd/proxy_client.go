@@ -69,7 +69,7 @@ func (t *tcpServerConn) Consume(consumeFn func([]byte) error) error {
 }
 
 type udpServerConn struct {
-	conn *net.UDPConn
+	conn net.Conn
 }
 
 func (u *udpServerConn) Close() error {
@@ -122,6 +122,8 @@ type clientProxy struct {
 	closed        atomic.Bool
 	udpTraffic    *trafficStats
 	cumTraffic    cumulativeTraffic
+	dialTCP       func(network, addr string, timeout time.Duration) (net.Conn, error)
+	dialUDP       func(network, addr string, timeout time.Duration) (net.Conn, error)
 }
 
 // cumulativeTraffic counts UDP wire datagrams for the lifetime of the
@@ -211,6 +213,10 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout time.Duration) (*serverConnHolder, error) {
 	var conn *serverConnHolder
 	var setReadDeadline func(t time.Time) error
+	hooked, err := p.hookedDial(p.dialTCP, proxyClient, connectTimeout)
+	if err != nil {
+		return nil, err
+	}
 	if proxyClient != nil {
 		tcpConn, err := proxyClient.DialTimeout(p.serverNet, p.serverAddr, connectTimeout)
 		if err != nil {
@@ -218,6 +224,9 @@ func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout tim
 		}
 		setReadDeadline = tcpConn.SetReadDeadline
 		conn = &serverConnHolder{&tcpServerConn{tcpConn}}
+	} else if hooked != nil {
+		setReadDeadline = hooked.SetReadDeadline
+		conn = &serverConnHolder{&tcpServerConn{hooked}}
 	} else {
 		serverAddr, err := doWithTimeout(func() (*net.TCPAddr, error) {
 			return net.ResolveTCPAddr(p.serverNet, p.serverAddr)
@@ -266,14 +275,33 @@ func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout tim
 	return conn, nil
 }
 
+// hookedDial runs a dial hook for a direct path; nil, nil means use the OS dial.
+func (p *clientProxy) hookedDial(dial func(network, addr string, timeout time.Duration) (net.Conn, error),
+	proxyClient *SshUdpClient, connectTimeout time.Duration) (net.Conn, error) {
+	if dial == nil || proxyClient != nil {
+		return nil, nil
+	}
+	conn, err := dial(p.serverNet, p.serverAddr, connectTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+	}
+	return conn, nil
+}
+
 func (p *clientProxy) renewUdpPath(proxyClient *SshUdpClient, connectTimeout time.Duration) (*serverConnHolder, error) {
 	var conn *serverConnHolder
+	hooked, err := p.hookedDial(p.dialUDP, proxyClient, connectTimeout)
+	if err != nil {
+		return nil, err
+	}
 	if proxyClient != nil {
 		udpConn, err := proxyClient.DialUDP(p.serverNet, p.serverAddr, connectTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("proxy dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 		}
 		conn = &serverConnHolder{udpConn}
+	} else if hooked != nil {
+		conn = &serverConnHolder{&udpServerConn{hooked}}
 	} else {
 		serverAddr, err := doWithTimeout(func() (*net.UDPAddr, error) {
 			return net.ResolveUDPAddr(p.serverNet, p.serverAddr)
@@ -539,6 +567,8 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 		clientID:      clientID,
 		serverID:      opts.ServerInfo.ServerID,
 		serverChecker: newTimeoutChecker(opts.HeartbeatTimeout),
+		dialTCP:       opts.DialTCP,
+		dialUDP:       opts.DialUDP,
 	}
 	proxy.backendCond = sync.NewCond(&proxy.backendMutex)
 
