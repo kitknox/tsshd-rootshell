@@ -60,37 +60,38 @@ type agentRequest struct {
 
 // SshUdpClient implements a UDP SSH client
 type SshUdpClient struct {
-	proxyClient      *SshUdpClient
-	protoClient      protocolClient
-	protoVersion     int
-	clientProxy      *clientProxy
-	intervalTime     time.Duration
-	connectTimeout   time.Duration
-	exitWG           sync.WaitGroup
-	closed           atomic.Bool
-	quited           atomic.Bool
-	detached         atomic.Bool
-	busMutex         sync.Mutex
-	busStream        Stream
-	busClosed        chan struct{}
-	sessionMutex     sync.Mutex
-	sessionID        atomic.Uint64
-	sessionMap       map[uint64]*SshUdpSession
-	channelMutex     sync.Mutex
-	channelMap       map[string]chan ssh.NewChannel
-	quitCallback     func(string)
-	discardCallback  func([]byte, uint64, uint64)
-	enableDebugging  bool
-	clientDebugFunc  func(int64, string)
-	enableWarning    bool
-	clientWarningFn  func(string)
-	activeChecker    *timeoutChecker
-	activeAckChan    chan int64
-	reconnectMutex   sync.Mutex
-	reconnectError   atomic.Pointer[error]
-	maxHeartbeatCnt  atomic.Uint64
-	needLogHeartbeat atomic.Bool
-	keepPendingInput atomic.Bool
+	proxyClient          *SshUdpClient
+	protoClient          protocolClient
+	protoVersion         int
+	clientProxy          *clientProxy
+	intervalTime         time.Duration
+	connectTimeout       time.Duration
+	exitWG               sync.WaitGroup
+	closed               atomic.Bool
+	quited               atomic.Bool
+	detached             atomic.Bool
+	busMutex             sync.Mutex
+	busStream            Stream
+	busClosed            chan struct{}
+	sessionMutex         sync.Mutex
+	sessionID            atomic.Uint64
+	sessionMap           map[uint64]*SshUdpSession
+	channelMutex         sync.Mutex
+	channelMap           map[string]chan ssh.NewChannel
+	quitCallback         func(string)
+	discardCallback      func([]byte, uint64, uint64)
+	enableDebugging      bool
+	clientDebugFunc      func(int64, string)
+	enableWarning        bool
+	clientWarningFn      func(string)
+	activeChecker        *timeoutChecker
+	activeAckChan        chan int64
+	reconnectMutex       sync.Mutex
+	reconnectError       atomic.Pointer[error]
+	maxHeartbeatCnt      atomic.Uint64
+	needLogHeartbeat     atomic.Bool
+	keepPendingInput     atomic.Bool
+	shouldPauseReconnect func() (bool, string)
 }
 
 // UdpClientOptions contains all configuration parameters required to create and initialize a new SshUdpClient
@@ -117,7 +118,8 @@ type UdpClientOptions struct {
 	DialTCP func(network, addr string, timeout time.Duration) (net.Conn, error)
 	DialUDP func(network, addr string, timeout time.Duration) (net.Conn, error)
 	// MaxPacketSize caps KCP/QUIC packets when the server sends no MTU; 0 keeps the default.
-	MaxPacketSize uint16
+	MaxPacketSize        uint16
+	ShouldPauseReconnect func() (pause bool, reason string)
 }
 
 // NewSshUdpClient creates a SshUdpClient
@@ -136,19 +138,20 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	}
 
 	udpClient = &SshUdpClient{
-		proxyClient:     opts.ProxyClient,
-		protoVersion:    min(opts.ServerInfo.ProtoVer, kTsshdProtocol),
-		sessionMap:      make(map[uint64]*SshUdpSession),
-		channelMap:      make(map[string]chan ssh.NewChannel),
-		intervalTime:    opts.IntervalTime,
-		connectTimeout:  opts.ConnectTimeout,
-		quitCallback:    opts.QuitCallback,
-		discardCallback: opts.DiscardCallback,
-		enableDebugging: opts.EnableDebugging,
-		clientDebugFunc: opts.DebugFunc,
-		enableWarning:   opts.EnableWarning,
-		clientWarningFn: opts.WarningFunc,
-		activeChecker:   newTimeoutChecker(opts.HeartbeatTimeout),
+		proxyClient:          opts.ProxyClient,
+		protoVersion:         min(opts.ServerInfo.ProtoVer, kTsshdProtocol),
+		sessionMap:           make(map[uint64]*SshUdpSession),
+		channelMap:           make(map[string]chan ssh.NewChannel),
+		intervalTime:         opts.IntervalTime,
+		connectTimeout:       opts.ConnectTimeout,
+		quitCallback:         opts.QuitCallback,
+		discardCallback:      opts.DiscardCallback,
+		enableDebugging:      opts.EnableDebugging,
+		clientDebugFunc:      opts.DebugFunc,
+		enableWarning:        opts.EnableWarning,
+		clientWarningFn:      opts.WarningFunc,
+		activeChecker:        newTimeoutChecker(opts.HeartbeatTimeout),
+		shouldPauseReconnect: opts.ShouldPauseReconnect,
 	}
 	defer func() {
 		if err != nil {
@@ -630,6 +633,16 @@ func (c *SshUdpClient) tryToReconnect() {
 	}
 
 	for c.activeChecker.isTimeout() && !c.IsClosed() {
+		if c.shouldPauseReconnect != nil {
+			if pause, reason := c.shouldPauseReconnect(); pause {
+				err := fmt.Errorf("reconnect paused: %s", reason)
+				c.debug("%s", err.Error())
+				c.reconnectError.Store(&err)
+				time.Sleep(3 * time.Second)
+				continue
+			}
+		}
+
 		c.debug("attempting new transport path")
 
 		if c.enableDebugging {
