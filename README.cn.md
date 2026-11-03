@@ -177,7 +177,7 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
   </details>
 
-- 用 Go 直接安装（ 要求 go 1.25 以上 ）
+- 用 Go 直接安装（ 要求 go 1.26 以上 ）
 
   <details><summary><code>go install github.com/trzsz/tsshd/cmd/tsshd@latest</code></summary>
 
@@ -193,7 +193,7 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
   </details>
 
-- 用 Go 自己编译（ 要求 go 1.25 以上 ）
+- 用 Go 自己编译（ 要求 go 1.26 以上 ）
 
   <details><summary><code>sudo make install</code></summary>
 
@@ -289,15 +289,17 @@ Host xxx
     #!! UdpMode yes
     #!! TsshdPort 61001-61999
     #!! TsshdPath ~/go/bin/tsshd
-    #!! UdpAliveTimeout 86400
+    #!! UdpAliveTimeout 1w3d
     #!! UdpHeartbeatTimeout 3
     #!! UdpReconnectTimeout 15
+    #!! UdpReconnectExitKey ^d
     #!! ShowNotificationOnTop yes
     #!! ShowFullNotifications yes
     #!! UdpProxyMode UDP
     #!! UdpMTU 1400
     #!! UdpSessionAttach no
     #!! UdpSessionName xxx
+    #!! UdpCompression zstd
 ```
 
 - `UdpMode`: `no` (默认为`no`: tssh 工作在 TCP 模式), `yes` (默认协议: `QUIC`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) 协议：速度更快), `KCP` ([KCP](https://github.com/xtaci/kcp-go) 协议：延迟更低).
@@ -306,11 +308,13 @@ Host xxx
 
 - `TsshdPath`: 指定服务器上 tsshd 二进制程序的路径，如果未配置，则在 $PATH 中查找。也可在命令行中使用 `--tsshd-path` 指定路径。
 
-- `UdpAliveTimeout`: 如果断开连接的时间超过 `UdpAliveTimeout` 秒，tssh 和 tsshd 都会退出，不再支持重连。默认值为 86400 秒。
+- `UdpAliveTimeout`: 如果断开连接的时间超过 `UdpAliveTimeout` 设置的时间，tssh 和 tsshd 都会退出，不再支持重连。支持的单位：`w` 周， `d` 天，`h` 时，`m` 分，`s` 秒。默认值为 `1w3d` (10天)。
 
-- `UdpHeartbeatTimeout`: 如果断开连接的时间超过 `UdpHeartbeatTimeout` 秒，tssh 将会尝试换条路重新连到服务器。默认值为 3 秒。
+- `UdpHeartbeatTimeout`: 如果断开连接的时间超过 `UdpHeartbeatTimeout` 设置的时间，tssh 将会尝试换条路重新连到服务器。默认值为 3 秒。
 
-- `UdpReconnectTimeout`: 如果断开连接的时间超过 `UdpReconnectTimeout` 秒，tssh 将会显示失去连接的通知公告。默认值为 15 秒。
+- `UdpReconnectTimeout`: 如果断开连接的时间超过 `UdpReconnectTimeout` 设置的时间，tssh 将会显示失去连接的通知公告。默认值为 15 秒。
+
+- `UdpReconnectExitKey`: 指定在断开连接并尝试重连时，用于退出（或脱离）等待状态的快捷键。支持的值包括 `none`、`ctrl+<字母>` 和 `^<字母>`。默认值为 `^d`（即 Ctrl+D）。
 
 - `ShowNotificationOnTop`: 是否在屏幕顶部显示失去连接的通知。默认为 yes，这可能会覆盖之前的一些输出。设置为 `no` 在光标当前行显示通知。
 
@@ -323,6 +327,8 @@ Host xxx
 - `UdpSessionAttach`: 默认为 `no`。配置为 `yes` 时，允许附加到服务器上已存在的会话；同时，本次登录的会话也会运行在可附加模式下，支持后续在其他设备或网络下重新登录时附加。
 
 - `UdpSessionName`: 自定义会话名称。仅在 `UdpSessionAttach` 配置为 `yes` 或通过 `--attach` 参数登录时生效。若服务器端已存在该名称的会话，将直接附加；若不存在，则以此名称创建新会话，供后续登录时自动附加。
+
+- `UdpCompression`：设置为 `zstd` 时，启用 UDP 会话输出的 Zstandard 压缩。服务端支持时默认使用 `zstd`。设置为 `none` 可禁用压缩。
 
 ## UDP 端口转发
 

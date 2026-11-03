@@ -63,6 +63,7 @@ type SshUdpClient struct {
 	proxyClient          *SshUdpClient
 	protoClient          protocolClient
 	protoVersion         int
+	compression          string
 	clientProxy          *clientProxy
 	intervalTime         time.Duration
 	connectTimeout       time.Duration
@@ -78,6 +79,7 @@ type SshUdpClient struct {
 	sessionMap           map[uint64]*SshUdpSession
 	channelMutex         sync.Mutex
 	channelMap           map[string]chan ssh.NewChannel
+	rttCallback          func(int64)
 	quitCallback         func(string)
 	discardCallback      func([]byte, uint64, uint64)
 	enableDebugging      bool
@@ -96,30 +98,37 @@ type SshUdpClient struct {
 
 // UdpClientOptions contains all configuration parameters required to create and initialize a new SshUdpClient
 type UdpClientOptions struct {
-	ProxyClient      *SshUdpClient
-	EnableDebugging  bool
-	EnableWarning    bool
-	IPv4             bool
-	IPv6             bool
-	TsshdAddr        string
-	SessionName      string
-	ServerInfo       *ServerInfo
-	AliveTimeout     time.Duration
-	IntervalTime     time.Duration
-	ConnectTimeout   time.Duration
-	HeartbeatTimeout time.Duration
-	DebugFunc        func(int64, string)
-	WarningFunc      func(string)
-	QuitCallback     func(reason string)
-	DiscardCallback  func(discardedInput []byte, discardedOutputLines, discardedOutputBytes uint64)
+	ProxyClient          *SshUdpClient
+	EnableDebugging      bool
+	EnableWarning        bool
+	IPv4                 bool
+	IPv6                 bool
+	TsshdAddr            string
+	SessionName          string
+	ServerInfo           *ServerInfo
+	AliveTimeout         time.Duration
+	IntervalTime         time.Duration
+	ConnectTimeout       time.Duration
+	HeartbeatTimeout     time.Duration
+	DebugFunc            func(int64, string)
+	WarningFunc          func(string)
+	RttCallback          func(rtt int64)
+	QuitCallback         func(reason string)
+	DiscardCallback      func(discardedInput []byte, discardedOutputLines, discardedOutputBytes uint64)
+	ProxyCommand         string
+	ShouldPauseReconnect func() (pause bool, reason string)
+
+	// Compression specifies the session output compression algorithm.
+	// An empty value defaults to zstd when supported by the server; "none" disables compression.
+	Compression string
+
 	// DialTCP and DialUDP, when set, run before each OS dial to TsshdAddr (e.g. for a userspace
 	// network); a nil conn with a nil error falls back to the OS dial. DialUDP must return a
 	// connection that preserves datagram boundaries.
 	DialTCP func(network, addr string, timeout time.Duration) (net.Conn, error)
 	DialUDP func(network, addr string, timeout time.Duration) (net.Conn, error)
 	// MaxPacketSize caps KCP/QUIC packets when the server sends no MTU; 0 keeps the default.
-	MaxPacketSize        uint16
-	ShouldPauseReconnect func() (pause bool, reason string)
+	MaxPacketSize uint16
 }
 
 // NewSshUdpClient creates a SshUdpClient
@@ -130,20 +139,28 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	if opts.ServerInfo.ProtoVer == 0 {
 		ver, err := parseTsshdVersion(opts.ServerInfo.ServerVer)
 		if err != nil {
-			return nil, fmt.Errorf("tsshd version invalid: %v", err)
+			return nil, fmt.Errorf("tsshd version invalid: %w", err)
 		}
 		if ver.compare(&tsshdVersion{0, 1, 6}) < 0 {
 			return nil, fmt.Errorf("please upgrade tsshd to continue")
 		}
 	}
 
+	protoVersion := min(opts.ServerInfo.ProtoVer, kTsshdProtocol)
+	compression, err := selectCompression(protoVersion, opts.Compression)
+	if err != nil {
+		return nil, err
+	}
+
 	udpClient = &SshUdpClient{
 		proxyClient:          opts.ProxyClient,
-		protoVersion:         min(opts.ServerInfo.ProtoVer, kTsshdProtocol),
+		protoVersion:         protoVersion,
+		compression:          compression,
 		sessionMap:           make(map[uint64]*SshUdpSession),
 		channelMap:           make(map[string]chan ssh.NewChannel),
 		intervalTime:         opts.IntervalTime,
 		connectTimeout:       opts.ConnectTimeout,
+		rttCallback:          opts.RttCallback,
 		quitCallback:         opts.QuitCallback,
 		discardCallback:      opts.DiscardCallback,
 		enableDebugging:      opts.EnableDebugging,
@@ -176,7 +193,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 			if pos := strings.LastIndex(opts.TsshdAddr, ":"); pos >= 0 {
 				port = opts.TsshdAddr[pos+1:]
 			}
-			err = fmt.Errorf("%v\r\n%s", err, fmt.Sprintf(
+			err = fmt.Errorf("%w\r\n%s", err, fmt.Sprintf(
 				"\033[0;36mHint:\033[0m This may be caused by a firewall blocking the %s port (%s) that tsshd is listening on.", net, port))
 		}
 		return
@@ -206,7 +223,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 
 	busStream, err := doWithTimeout(func() (Stream, error) { return udpClient.newStream("bus") }, opts.ConnectTimeout)
 	if err != nil {
-		err = fmt.Errorf("new bus stream failed: %v", err)
+		err = fmt.Errorf("new bus stream failed: %w", err)
 		return
 	}
 
@@ -227,7 +244,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	err = recvResponse(busStream, &resp)
 	if err != nil {
 		_ = busStream.Close()
-		err = fmt.Errorf("bus stream init failed: %v", err)
+		err = fmt.Errorf("bus stream init failed: %w", err)
 		return
 	}
 	udpClient.debug("bus response next session id: %d", resp.NextSessionID)
@@ -385,7 +402,7 @@ func (c *SshUdpClient) NewSession() (*SshUdpSession, error) {
 		return nil, err
 	}
 	c.exitWG.Add(1)
-	udpSession := &SshUdpSession{client: c, stream: stream, envs: make(map[string]string)}
+	udpSession := &SshUdpSession{client: c, stream: stream, envs: make(map[string]string), code: -1}
 	udpSession.exitWG.Add(1)
 	c.sessionMutex.Lock()
 	defer c.sessionMutex.Unlock()
@@ -714,6 +731,10 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 		}
 
 		ackTime := <-c.activeAckChan
+
+		if c.rttCallback != nil {
+			go c.rttCallback(time.Now().UnixMilli() - ackTime)
+		}
 
 		if c.enableDebugging {
 			timeout := c.activeChecker.isTimeout()
@@ -1080,12 +1101,28 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 			ChannelType: kAgentChannelType,
 		}
 	}
+
+	msg.Compression = s.client.compression
+	if msg.Compression != "" {
+		s.client.debug("session [%d] requested compression with %s", s.id, msg.Compression)
+	}
+
 	if err := sendMessage(s.stream, msg); err != nil {
+		_ = s.stream.Close()
 		return fmt.Errorf("send session message failed: %w", err)
 	}
 	if err := recvError(s.stream); err != nil {
+		_ = s.stream.Close()
 		return err
 	}
+
+	outStream, err := decompressOutput(msg.Compression, s.stream)
+	if err != nil {
+		_ = s.stream.Close()
+		return fmt.Errorf("decompress stdout failed: %w", err)
+	}
+	s.stream = outStream
+
 	if s.stdin != nil {
 		go s.forwardInput()
 	}
@@ -1222,9 +1259,16 @@ func (s *SshUdpSession) StderrPipe() (io.Reader, error) {
 		_ = stream.Close()
 		return nil, err
 	}
+
+	errStream, err := decompressOutput(s.client.compression, stream)
+	if err != nil {
+		_ = stream.Close()
+		return nil, fmt.Errorf("decompress stderr failed: %w", err)
+	}
+
 	reader, writer := io.Pipe()
 	s.stderr = writer
-	s.errForwarder = s.newOutputForwarder("stderr", stream, s.stderr)
+	s.errForwarder = s.newOutputForwarder("stderr", errStream, s.stderr)
 	s.exitWG.Go(func() { s.errForwarder.forward() })
 	return reader, nil
 }
@@ -1335,7 +1379,7 @@ func (s *SshUdpSession) RedrawScreen(discardPreviousOutput bool) error {
 		// are discarded together with cached output.
 		bytes := make([]byte, 30)
 		if _, err := rand.Read(bytes); err != nil {
-			return fmt.Errorf("generate discard marker failed: %v", err)
+			return fmt.Errorf("generate discard marker failed: %w", err)
 		}
 		marker = fmt.Appendf(nil, "[TSSHD-MARKER-%s]", base64.StdEncoding.EncodeToString(bytes))
 		s.client.debug("discard previous output marker: %s", string(marker))
@@ -1355,7 +1399,7 @@ func (s *SshUdpSession) RedrawScreen(discardPreviousOutput bool) error {
 		Redraw: true,
 		Marker: marker,
 	}); err != nil {
-		return fmt.Errorf("send redraw message failed: %v", err)
+		return fmt.Errorf("send redraw message failed: %w", err)
 	}
 
 	return nil
@@ -1449,7 +1493,7 @@ type sshUdpConn struct {
 func (c *sshUdpConn) Write(buf []byte) (int, error) {
 	if c.client.clientProxy.serverChecker.isTimeout() {
 		if err := c.client.clientProxy.serverChecker.waitUntilReconnected(); err != nil {
-			return 0, fmt.Errorf("server timeout and closed: %v", err)
+			return 0, fmt.Errorf("server timeout and closed: %w", err)
 		}
 	}
 	return c.Stream.Write(buf)
@@ -1515,7 +1559,7 @@ type sshUdpChannel struct {
 func (c *sshUdpChannel) Write(buf []byte) (int, error) {
 	if c.client.clientProxy.serverChecker.isTimeout() {
 		if err := c.client.clientProxy.serverChecker.waitUntilReconnected(); err != nil {
-			return 0, fmt.Errorf("server timeout and closed: %v", err)
+			return 0, fmt.Errorf("server timeout and closed: %w", err)
 		}
 	}
 	return c.Stream.Write(buf)

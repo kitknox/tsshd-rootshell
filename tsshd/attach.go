@@ -268,11 +268,9 @@ func (s *replaceableStream) RemoteAddr() net.Addr {
 }
 
 type replaceableTimeoutChecker struct {
-	mu        sync.Mutex
-	cancel    chan struct{}
-	checker   *timeoutChecker
-	gen       uint64
-	callbacks []func()
+	mu      sync.Mutex
+	cancel  chan struct{}
+	checker *timeoutChecker
 }
 
 func newReplaceableTimeoutChecker(checker *timeoutChecker) *replaceableTimeoutChecker {
@@ -286,24 +284,7 @@ func (c *replaceableTimeoutChecker) swap(newChecker *timeoutChecker) {
 	close(c.cancel)
 	c.cancel = make(chan struct{})
 
-	oldChecker := c.checker
 	c.checker = newChecker
-
-	c.gen++
-
-	if newChecker == nil {
-		return
-	}
-
-	if oldChecker == nil && !newChecker.isTimeout() {
-		for _, cb := range c.callbacks {
-			go cb()
-		}
-	}
-
-	for _, cb := range c.callbacks {
-		newChecker.onReconnected(c.wrapCallback(cb, c.gen))
-	}
 }
 
 func (c *replaceableTimeoutChecker) isTimeout() bool {
@@ -350,31 +331,6 @@ func (c *replaceableTimeoutChecker) waitUntilReconnected() error {
 			c.mu.Unlock()
 		case <-cancel:
 		}
-	}
-}
-
-func (c *replaceableTimeoutChecker) onReconnected(cb func()) {
-	c.mu.Lock()
-	checker, gen := c.checker, c.gen
-	c.callbacks = append(c.callbacks, cb)
-	c.mu.Unlock()
-
-	if checker != nil {
-		wrapper := c.wrapCallback(cb, gen)
-		checker.onReconnected(wrapper)
-	}
-}
-
-func (c *replaceableTimeoutChecker) wrapCallback(cb func(), gen uint64) func() {
-	return func() {
-		c.mu.Lock()
-		if c.gen != gen {
-			c.mu.Unlock()
-			return
-		}
-		c.mu.Unlock()
-
-		cb()
 	}
 }
 
@@ -429,7 +385,16 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 		return nil, 0, fmt.Errorf("invalid session state: err stream is nil")
 	}
 
+	outStream, err := compressOutput(msg.Compression, ioStream)
+	if err != nil {
+		return nil, 0, fmt.Errorf("compress stdout failed: %v", err)
+	}
+	if msg.Compression != "" {
+		debug("session [%d] output compressed with %s", msg.ID, msg.Compression)
+	}
+
 	if err := sendSuccess(ioStream); err != nil { // ack ok
+		_ = outStream.Close()
 		return nil, 0, fmt.Errorf("ack ok failed: %v", err)
 	}
 
@@ -437,7 +402,7 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 	// since incoming data may immediately require the server instance.
 	sess.server.Store(s)
 
-	sess.ioStream.swap(ioStream)
+	sess.ioStream.swap(outStream)
 	sess.errStream.swap(errStream)
 
 	if pty {
@@ -466,6 +431,9 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 	// where cached output could be delivered before SetSize() has enabled
 	// output discard for the redraw operation.
 	sess.clientChecker.swap(s.clientChecker)
+	// swap no longer triggers reconnect callbacks, so notify the session
+	// explicitly after the attach process is fully initialized.
+	go sess.onReconnected()
 
 	debug("session [%d] attached by client [%x]", msg.ID, s.client.proxyAddr.clientID)
 

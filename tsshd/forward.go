@@ -53,7 +53,7 @@ func streamLocalBindMask() int {
 // path exists and is a unix socket, it is removed. Non-socket files are
 // refused. Missing paths are a no-op.
 func unlinkStaleUnixSocket(path string) error {
-	if strings.ToLower(getSshdConfig("StreamLocalBindUnlink")) != "yes" {
+	if !strings.EqualFold(getSshdConfig("StreamLocalBindUnlink"), "yes") {
 		return nil
 	}
 	info, err := os.Lstat(path)
@@ -89,19 +89,19 @@ func (s *sshUdpServer) handleDialEvent(stream Stream) {
 		return
 	}
 
-	if v := strings.ToLower(getSshdConfig("AllowTcpForwarding")); v == "no" || v == "remote" {
+	if v := getSshdConfig("AllowTcpForwarding"); strings.EqualFold(v, "no") || strings.EqualFold(v, "remote") {
 		sendProhibited(stream, "AllowTcpForwarding")
 		return
 	}
 
 	if msg.Net == "unix" {
-		if v := strings.ToLower(getSshdConfig("AllowStreamLocalForwarding")); v == "no" || v == "remote" {
+		if v := getSshdConfig("AllowStreamLocalForwarding"); strings.EqualFold(v, "no") || strings.EqualFold(v, "remote") {
 			sendProhibited(stream, "AllowStreamLocalForwarding")
 			return
 		}
 	}
 
-	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
+	if strings.EqualFold(getSshdConfig("DisableForwarding"), "yes") {
 		sendProhibited(stream, "DisableForwarding")
 		return
 	}
@@ -139,19 +139,19 @@ func (s *sshUdpServer) handleListenEvent(stream Stream) {
 		return
 	}
 
-	if v := strings.ToLower(getSshdConfig("AllowTcpForwarding")); v == "no" || v == "local" {
+	if v := getSshdConfig("AllowTcpForwarding"); strings.EqualFold(v, "no") || strings.EqualFold(v, "local") {
 		sendProhibited(stream, "AllowTcpForwarding")
 		return
 	}
 
 	if msg.Net == "unix" {
-		if v := strings.ToLower(getSshdConfig("AllowStreamLocalForwarding")); v == "no" || v == "local" {
+		if v := getSshdConfig("AllowStreamLocalForwarding"); strings.EqualFold(v, "no") || strings.EqualFold(v, "local") {
 			sendProhibited(stream, "AllowStreamLocalForwarding")
 			return
 		}
 	}
 
-	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
+	if strings.EqualFold(getSshdConfig("DisableForwarding"), "yes") {
 		sendProhibited(stream, "DisableForwarding")
 		return
 	}

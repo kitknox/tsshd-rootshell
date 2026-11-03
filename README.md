@@ -192,7 +192,7 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
 
   </details>
 
-- Install with Go ( Requires go 1.25 or later )
+- Install with Go ( Requires go 1.26 or later )
 
   <details><summary><code>go install github.com/trzsz/tsshd/cmd/tsshd@latest</code></summary>
 
@@ -208,7 +208,7 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
 
   </details>
 
-- Build from source ( Requires go 1.25 or later )
+- Build from source ( Requires go 1.26 or later )
 
   <details><summary><code>sudo make install</code></summary>
 
@@ -304,15 +304,17 @@ Host xxx
     #!! UdpMode yes
     #!! TsshdPort 61001-61999
     #!! TsshdPath ~/go/bin/tsshd
-    #!! UdpAliveTimeout 86400
+    #!! UdpAliveTimeout 1w3d
     #!! UdpHeartbeatTimeout 3
     #!! UdpReconnectTimeout 15
+    #!! UdpReconnectExitKey ^d
     #!! ShowNotificationOnTop yes
     #!! ShowFullNotifications yes
     #!! UdpProxyMode UDP
     #!! UdpMTU 1400
     #!! UdpSessionAttach no
     #!! UdpSessionName xxx
+    #!! UdpCompression zstd
 ```
 
 - `UdpMode`: `no` (the default: tssh works in TCP mode), `yes` (default protocol: `QUIC`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) protocol: faster speed), `KCP` ([KCP](https://github.com/xtaci/kcp-go) protocol: lower latency).
@@ -321,11 +323,13 @@ Host xxx
 
 - `TsshdPath`: Specifies the path to the tsshd binary on the server, lookup in $PATH if not configured. You can also specify the path on the command line using `--tsshd-path`.
 
-- `UdpAliveTimeout`: If the disconnection lasts longer than `UdpAliveTimeout` in seconds, tssh and tsshd will both exit, and no longer support reconnection. The default is 86400 seconds.
+- `UdpAliveTimeout`: If the disconnection lasts longer than the time specified by `UdpAliveTimeout`, tssh and tsshd will both exit, and no longer support reconnection. Supported units: `w` for weeks, `d` for days, `h` for hours, `m` for minutes, `s` for seconds. The default is `1w3d` (10 days).
 
-- `UdpHeartbeatTimeout`: If the disconnection lasts longer than `UdpHeartbeatTimeout` in seconds, tssh will try to reconnect to the server by a new path. The default is 3 seconds.
+- `UdpHeartbeatTimeout`: If the disconnection lasts longer than the time specified by `UdpHeartbeatTimeout`, tssh will try to reconnect to the server by a new path. The default is 3 seconds.
 
-- `UdpReconnectTimeout`: If the disconnection lasts longer than `UdpReconnectTimeout` in seconds, tssh will display a notification indicating that the connection has been lost. The default is 15 seconds.
+- `UdpReconnectTimeout`: If the disconnection lasts longer than the time specified by `UdpReconnectTimeout`, tssh will display a notification indicating that the connection has been lost. The default is 15 seconds.
+
+- `UdpReconnectExitKey`: Specifies the shortcut key to exit (or detach) while waiting for reconnection. It accepts `none`, `ctrl+<letter>`, and `^<letter>`. The default is `^d` (Ctrl+D).
 
 - `ShowNotificationOnTop`: Whether the connection loss notification is displayed on the top. The default is yes, which may overwrite some of the previous output. Set it to `no` to display notifications on the current line of the cursor.
 
@@ -338,6 +342,8 @@ Host xxx
 - `UdpSessionAttach`: Defaults to `no`. When set to `yes`, it allows attaching to an existing session on the server. Meanwhile, the current session will also be made attachable, allowing you to re-attach to it later when logging in from other devices or networks.
 
 - `UdpSessionName`: Customizes the session name. This only takes effect when `UdpSessionAttach` is set to `yes` or when logging in with the `--attach` argument. If a session with this name already exists on the server, it will attach directly; if not, a new session with this name will be created for automatic attachment in future logins.
+
+- `UdpCompression`: Set to `zstd` to enable Zstandard compression for UDP session output. Defaults to `zstd` when supported by the server. Set to `none` to disable compression.
 
 ### UDP Port Forwarding
 

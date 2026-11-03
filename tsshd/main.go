@@ -181,17 +181,23 @@ func background() (bool, io.ReadCloser, error) {
 	}
 
 	cmd := exec.Command(exePath, os.Args[1:]...)
-	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), kEnvTsshdBackground+"=TRUE")
 	cmd.SysProcAttr = getSysProcAttr()
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return true, nil, err
+		return true, nil, fmt.Errorf("background stdout pipe failed: %v", err)
 	}
 
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return true, nil, fmt.Errorf("background stderr pipe failed: %v", err)
+	}
+
+	go func() { _, _ = io.Copy(os.Stderr, stderr) }()
+
 	if err := cmd.Start(); err != nil {
-		return true, nil, err
+		return true, nil, fmt.Errorf("background cmd start failed: %v", err)
 	}
 
 	return true, stdout, nil
@@ -289,7 +295,7 @@ func RunMain(opts ...Option) (int, error) {
 	initSshdConfig()
 
 	if !enableDebugLogging {
-		if v := strings.ToLower(getSshdConfig("LogLevel")); v == "quiet" || v == "fatal" {
+		if v := getSshdConfig("LogLevel"); strings.EqualFold(v, "quiet") || strings.EqualFold(v, "fatal") {
 			enableWarningLogging = false
 		}
 	}

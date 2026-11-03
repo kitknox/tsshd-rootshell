@@ -124,11 +124,11 @@ func (f *clientOutputForwarder) forward() {
 type serverOutputForwarder struct {
 	name   string
 	sess   *sessionContext
-	reader io.Reader
+	reader io.ReadCloser
 	stream Stream
 
 	handleMutex sync.Mutex
-	returned    bool
+	returned    atomic.Bool
 	writeError  atomic.Bool
 	done        chan struct{}
 	writeBufCh  chan []byte
@@ -151,6 +151,8 @@ type serverOutputForwarder struct {
 
 	discardOutput atomic.Bool
 	discardMarker atomic.Pointer[[]byte]
+
+	lastForwardTime atomic.Pointer[time.Time]
 }
 
 func (f *serverOutputForwarder) writerLoop() {
@@ -316,8 +318,8 @@ func (f *serverOutputForwarder) onReconnected() {
 	f.handleMutex.Lock()
 	defer f.handleMutex.Unlock()
 
-	if f.returned {
-		return // do not flush after forwardoutput has returned
+	if f.returned.Load() {
+		return // forward has returned and writeBufCh is already closed.
 	}
 
 	f.flushOutput()
@@ -446,22 +448,28 @@ func (f *serverOutputForwarder) handleError() {
 func (f *serverOutputForwarder) forward() {
 	defer func() {
 		f.handleMutex.Lock()
-		f.returned = true
+		f.returned.Store(true)
 		close(f.writeBufCh)
 		f.handleMutex.Unlock()
 		<-f.done
+		_ = f.reader.Close()
 	}()
 
 	go f.writerLoop()
-
-	f.sess.clientChecker.onReconnected(f.onReconnected)
 
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := f.reader.Read(buffer)
 		if n > 0 {
+
+			if f.lastForwardTime.Load() != nil {
+				now := time.Now()
+				f.lastForwardTime.Store(&now)
+			}
+
 			buf := make([]byte, n)
 			copy(buf, buffer[:n])
+
 			if f.sess.screenBuf != nil {
 				select {
 				case f.sess.screenBuf <- buf:
@@ -473,6 +481,7 @@ func (f *serverOutputForwarder) forward() {
 					}
 				}
 			}
+
 			f.handleBuffer(buf)
 		}
 		if err != nil {
@@ -482,4 +491,32 @@ func (f *serverOutputForwarder) forward() {
 	}
 
 	debug("session [%d] %s completed", f.sess.id, f.name)
+}
+
+func (f *serverOutputForwarder) abortIfTimeout(timeout time.Duration, warnOnce *sync.Once) {
+	if f.returned.Load() {
+		return
+	}
+
+	now := time.Now()
+	f.lastForwardTime.Store(&now)
+
+	go func() {
+		for !f.returned.Load() {
+			lastForwardTime := *f.lastForwardTime.Load()
+			if time.Since(lastForwardTime) > timeout {
+				_ = f.reader.Close()
+				if warnOnce != nil {
+					warnOnce.Do(func() {
+						warning("child process has exited, but the output stream has not closed and no new output was received for %v", timeout)
+					})
+				}
+				return
+			}
+
+			if sleepTime := time.Until(lastForwardTime.Add(timeout)); sleepTime > 0 {
+				time.Sleep(sleepTime)
+			}
+		}
+	}()
 }

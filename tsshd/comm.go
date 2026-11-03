@@ -382,6 +382,15 @@ func (tc *timeoutChecker) notifyReconnected() {
 
 func (tc *timeoutChecker) checkTimeout() {
 	for !tc.closed.Load() {
+		// The system clock may jump forward and then be corrected, or be set
+		// backward, leaving lastAliveTime far ahead of the current time.
+		// This could delay timeout detection indefinitely, so clamp future
+		// timestamps to at most one second ahead of the current time.
+		maxAliveTime := time.Now().UnixMilli() + 1000
+		if lastAliveTime := tc.lastAliveTime.Load(); lastAliveTime > maxAliveTime {
+			tc.lastAliveTime.CompareAndSwap(lastAliveTime, maxAliveTime)
+		}
+
 		sleepTime := time.Until(time.UnixMilli(tc.lastAliveTime.Load()).Add(tc.heartbeatTimeout))
 		if sleepTime > 0 {
 			select {
@@ -514,4 +523,56 @@ func isDirExist(path string) bool {
 		return false
 	}
 	return stat.IsDir()
+}
+
+type procInfo struct {
+	pid  int
+	ppid int
+	pgid int
+	name string
+}
+
+func findAllDescendants(procs map[int]*procInfo, rootPid int) map[int]*procInfo {
+	childrenMap := make(map[int][]int)
+	for _, p := range procs {
+		childrenMap[p.ppid] = append(childrenMap[p.ppid], p.pid)
+	}
+
+	descendants := make(map[int]*procInfo)
+
+	var queue []int
+	if children, ok := childrenMap[rootPid]; ok {
+		queue = append(queue, children...)
+	}
+
+	for len(queue) > 0 {
+		currPid := queue[0]
+		queue = queue[1:]
+
+		if p, ok := procs[currPid]; ok {
+			descendants[currPid] = p
+
+			if children, ok := childrenMap[currPid]; ok {
+				queue = append(queue, children...)
+			}
+		}
+	}
+
+	return descendants
+}
+
+func findLeafProcesses(procs map[int]*procInfo) []*procInfo {
+	hasChildren := make(map[int]bool)
+	for _, p := range procs {
+		hasChildren[p.ppid] = true
+	}
+
+	var leaves []*procInfo
+	for _, p := range procs {
+		if !hasChildren[p.pid] {
+			leaves = append(leaves, p)
+		}
+	}
+
+	return leaves
 }

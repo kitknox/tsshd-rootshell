@@ -170,6 +170,25 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 			s.client.udpTraffic.recFlag.Store(true)
 		}
 	})
+
+	// Notify all sessions currently attached to this server when the client
+	// connection is re-established.
+	s.clientChecker.onReconnected(func() {
+		// Serialize with session attach/detach operations so that session ownership
+		// cannot change between checking sess.server and notifying the session.
+		attachMutex.Lock()
+		defer attachMutex.Unlock()
+
+		for _, sess := range getAllSessions() {
+			if sess.server.Load() != s {
+				// Skip sessions that are not owned by the current server.
+				continue
+			}
+			// Notify the session while its ownership is guaranteed to remain
+			// unchanged by attach/detach operations.
+			go sess.onReconnected()
+		}
+	})
 }
 
 func (s *sshUdpServer) activateServer(sessionName string) error {

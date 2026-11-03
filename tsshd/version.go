@@ -33,9 +33,9 @@ import (
 	"strings"
 )
 
-const kTsshdVersion = "0.1.8"
+const kTsshdVersion = "0.1.10"
 
-const kTsshdProtocol = 1
+const kTsshdProtocol = 2
 
 // buildTag stores the version tag injected at build time via -ldflags.
 var buildTag = ""
@@ -68,7 +68,7 @@ func getTsshdVersion() string {
 			if revision != "" {
 				version.WriteByte('-')
 				version.WriteString(revision[:min(7, len(revision))])
-				if strings.ToLower(modified) == "true" {
+				if strings.EqualFold(modified, "true") {
 					version.WriteString("-m")
 				}
 			}

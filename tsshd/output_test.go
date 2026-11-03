@@ -32,6 +32,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,6 +41,7 @@ import (
 )
 
 type mockStream struct {
+	mutex sync.Mutex
 	buf   bytes.Buffer
 	err   error
 	first bool
@@ -54,6 +56,8 @@ func (s *mockStream) Read(b []byte) (n int, err error) {
 }
 
 func (s *mockStream) Write(p []byte) (int, error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	if s.first {
 		time.Sleep(10 * time.Millisecond)
 		s.first = false
@@ -97,7 +101,15 @@ func (s *mockStream) SetWriteDeadline(t time.Time) error {
 }
 
 func (s *mockStream) String() string {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	return s.buf.String()
+}
+
+func (s *mockStream) setError(err error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.err = err
 }
 
 type chunkReader struct {
@@ -106,10 +118,16 @@ type chunkReader struct {
 	chunk   int
 	offset  int // offset within current segment
 	segment int // current segment index
+	closed  atomic.Bool
+	closeCh chan struct{}
 }
 
 func (r *chunkReader) Read(p []byte) (n int, err error) {
 	for {
+		if r.closed.Load() {
+			return 0, io.ErrClosedPipe
+		}
+
 		// no more segments
 		if r.segment >= len(r.data) {
 			return 0, io.EOF
@@ -118,7 +136,11 @@ func (r *chunkReader) Read(p []byte) (n int, err error) {
 		// wait when entering a new segment (except the first)
 		if r.offset == 0 && r.segment > 0 && r.segment-1 < len(r.signal) {
 			if ch := r.signal[r.segment-1]; ch != nil {
-				<-ch
+				select {
+				case <-ch:
+				case <-r.closeCh:
+					return 0, io.ErrClosedPipe
+				}
 			}
 		}
 
@@ -136,6 +158,16 @@ func (r *chunkReader) Read(p []byte) (n int, err error) {
 		r.offset += n
 		return n, nil
 	}
+}
+
+func (r *chunkReader) Close() error {
+	if !r.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	if r.closeCh != nil {
+		close(r.closeCh)
+	}
+	return nil
 }
 
 func newTestSessionContext(keepPending, timeout bool, maxLines int) (*sessionContext, func()) {
@@ -163,24 +195,27 @@ func newTestSessionContext(keepPending, timeout bool, maxLines int) (*sessionCon
 	sess := &sessionContext{rows: 0, clientChecker: newReplaceableTimeoutChecker(clientChecker)}
 	sess.server.Store(server)
 
-	return sess, func() { maxPendingOutputLines = oriMaxLines }
+	return sess, func() {
+		clientChecker.Close()
+		maxPendingOutputLines = oriMaxLines
+	}
 }
 
-func runForwardOutputAndReconnect(s *sessionContext, reader *chunkReader, stream *mockStream, callback func()) {
+func runForwardOutputAndReconnect(s *sessionContext, reader *chunkReader, stream *mockStream, callback func(*serverOutputForwarder)) {
 	var wg sync.WaitGroup
 
-	wg.Go(func() {
-		s.newOutputForwarder("stdout", reader, stream).forward()
-	})
+	forwarder := s.newOutputForwarder("stdout", reader, stream)
+	s.clientChecker.checker.onReconnected(forwarder.onReconnected)
+	wg.Go(forwarder.forward)
 
-	go func() {
+	wg.Go(func() {
 		if callback != nil {
 			time.Sleep(50 * time.Millisecond)
-			callback()
+			callback(forwarder)
 		}
 		time.Sleep(50 * time.Millisecond)
 		s.clientChecker.checker.updateNow()
-	}()
+	})
 
 	wg.Wait()
 }
@@ -221,7 +256,7 @@ func TestForwardOutput_WriteError(t *testing.T) {
 	defer reset()
 
 	stream := newMockStream()
-	stream.err = errors.New("mock write error")
+	stream.setError(errors.New("mock write error"))
 	reader := &chunkReader{data: [][]byte{[]byte("a\nb\nc\n")}, chunk: 1}
 
 	s.newOutputForwarder("stdout", reader, stream).forward()
@@ -289,7 +324,7 @@ func TestForwardOutput_FlushCacheBranch(t *testing.T) {
 		chunk:  1,
 	}
 
-	runForwardOutputAndReconnect(s, reader, stream, func() { close(signal) })
+	runForwardOutputAndReconnect(s, reader, stream, func(*serverOutputForwarder) { close(signal) })
 
 	output := stream.String()
 	assert.True(strings.HasPrefix(output, "a\n"), output)
@@ -317,8 +352,8 @@ func TestForwardOutput_FlushWriteError(t *testing.T) {
 		chunk:  1,
 	}
 
-	runForwardOutputAndReconnect(s, reader, stream, func() {
-		stream.err = errors.New("mock write error")
+	runForwardOutputAndReconnect(s, reader, stream, func(*serverOutputForwarder) {
+		stream.setError(errors.New("mock write error"))
 		close(signal)
 	})
 
@@ -574,7 +609,9 @@ func TestForwardOutput_ReconnectWhileReadBlocked(t *testing.T) {
 		chunk:  1,
 	}
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		runForwardOutputAndReconnect(s, reader, stream, nil)
 	}()
 
@@ -583,6 +620,8 @@ func TestForwardOutput_ReconnectWhileReadBlocked(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 
 	close(block)
+	<-done
+	assert.Equal("a\nb\nc\nd\n", stream.String())
 }
 
 func TestForwardOutput_TimeoutWithoutNewLine(t *testing.T) {
@@ -601,4 +640,101 @@ func TestForwardOutput_TimeoutWithoutNewLine(t *testing.T) {
 	assert.NotContains(output, "\r\n")
 	assert.NotContains(output, "c\r")
 	assert.True(strings.HasSuffix(output, "e\rf\r"), output)
+}
+
+func TestForwardOutput_AbortIfTimeout(t *testing.T) {
+	assert := assert.New(t)
+
+	s, reset := newTestSessionContext(false, false, 10)
+	defer reset()
+
+	stream := newMockStream()
+
+	block := make(chan struct{})
+
+	reader := &chunkReader{
+		data: [][]byte{
+			[]byte("a\n"),
+			[]byte("b\n"),
+		},
+		signal:  []chan struct{}{block},
+		chunk:   1,
+		closeCh: make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		runForwardOutputAndReconnect(s, reader, stream, func(forwarder *serverOutputForwarder) {
+			forwarder.abortIfTimeout(10*time.Millisecond, nil)
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		assert.Equal("a\n", stream.String())
+		assert.True(reader.closed.Load())
+	case <-time.After(time.Second):
+		assert.Fail("output forwarding did not abort after the timeout")
+	}
+}
+
+func TestForwardOutput_AbortIfTimeoutWithNewOutput(t *testing.T) {
+	assert := assert.New(t)
+
+	s, reset := newTestSessionContext(false, false, 10)
+	defer reset()
+
+	stream := newMockStream()
+
+	signal := make(chan struct{})
+	block := make(chan struct{})
+
+	reader := &chunkReader{
+		data: [][]byte{
+			[]byte("a\n"),
+			[]byte("b\n"),
+			[]byte("c\n"),
+		},
+		signal:  []chan struct{}{signal, block},
+		chunk:   1,
+		closeCh: make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		runForwardOutputAndReconnect(s, reader, stream, func(forwarder *serverOutputForwarder) {
+			forwarder.abortIfTimeout(100*time.Millisecond, nil)
+			time.Sleep(50 * time.Millisecond)
+			close(signal)
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		assert.Equal("a\nb\n", stream.String())
+		assert.True(reader.closed.Load())
+	case <-time.After(time.Second):
+		assert.Fail("output forwarding did not abort after the timeout")
+	}
+}
+
+func TestForwardOutput_AbortIfTimeoutAfterReturned(t *testing.T) {
+	assert := assert.New(t)
+	s, reset := newTestSessionContext(false, false, 10)
+	defer reset()
+
+	stream := newMockStream()
+	reader := &chunkReader{data: [][]byte{[]byte("a\nb\nc\n")}, chunk: 1}
+
+	forwarder := s.newOutputForwarder("stdout", reader, stream)
+	forwarder.forward()
+
+	assert.Equal("a\nb\nc\n", stream.String())
+
+	forwarder.abortIfTimeout(10*time.Millisecond, nil)
+
+	assert.True(reader.closed.Load())
+	assert.Nil(forwarder.lastForwardTime.Load())
 }

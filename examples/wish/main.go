@@ -25,7 +25,6 @@ SOFTWARE.
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -37,8 +36,8 @@ import (
 	"strings"
 	"sync"
 
+	"charm.land/ssh"
 	"charm.land/wish/v2"
-	"github.com/charmbracelet/ssh"
 	"github.com/trzsz/tsshd/tsshd"
 	"golang.org/x/term"
 )
@@ -235,37 +234,37 @@ func handleBusiness(sess Session) bool {
 // SSH_CONNECTION is rebuilt from the active session so the new process
 // sees the correct client/server endpoints.
 //
-// Stdout and stderr are merged and streamed to the session. The first
-// line of output is treated as a readiness signal: once observed, this
-// function exits the current session, allowing the subprocess to take
-// over the session lifecycle.
+// The subprocess acts as a short-lived launcher. It starts the long-lived
+// tsshd process in the background and then exits, allowing the tsshd process
+// to take over the subsequent session handling.
 //
-// Internally, the subprocess acts as a short-lived launcher: it is
-// expected to exec/spawn the long-lived tsshd process and then exit.
-// We only wait for and reap this intermediate process; the actual
-// service continues running independently.
+// Stdout and stderr from the launcher are merged and captured by
+// CombinedOutput. The launcher output contains the result of starting
+// tsshd: on success, it provides information required by the client to
+// connect to the new tsshd instance; on failure, it contains the error
+// message.
+//
+// Once the launcher exits, its output is forwarded to the current SSH
+// session, and the current session is closed. On successful startup,
+// the client can then use the reported information to connect to the
+// background tsshd instance.
 //
 // This pattern enables a hybrid SSH server that can seamlessly hand off
 // an existing session to tsshd (e.g. for tssh roaming) within the same
 // application (the same binary).
 func launchTsshServer(args []string, sess ssh.Session) {
-	// Resolve the current executable path for re-exec.
+	// Resolve the current executable path for re-execution.
 	exePath, err := os.Executable()
 	if err != nil {
 		_, _ = fmt.Fprintf(sess, "failed to get current executable path: %v\r\n", err)
 		return
 	}
 
-	// Spawn a subprocess running the same binary with provided args.
+	// Create a subprocess running the same binary with the provided args.
 	cmd := exec.Command(exePath, args...)
 
-	// Merge stdout and stderr into a single stream.
-	reader, writer := io.Pipe()
-	cmd.Stdout = writer
-	cmd.Stderr = writer
-
 	// Rebuild environment variables, overriding SSH_CONNECTION with
-	// the current session's addresses.
+	// the addresses of the current SSH session.
 	for _, env := range os.Environ() {
 		if !strings.HasPrefix(env, "SSH_CONNECTION=") {
 			cmd.Env = append(cmd.Env, env)
@@ -274,28 +273,20 @@ func launchTsshServer(args []string, sess ssh.Session) {
 	cmd.Env = append(cmd.Env, fmt.Sprintf("SSH_CONNECTION=%s %s",
 		addrToString(sess.RemoteAddr()), addrToString(sess.LocalAddr())))
 
-	// Start the subprocess.
-	if err := cmd.Start(); err != nil {
-		_, _ = fmt.Fprintf(sess, "failed to start subprocess: %v\r\n", err)
+	// Run the launcher and capture its combined stdout and stderr.
+	// The launcher starts the long-lived tsshd process in the background
+	// and then exits, so CombinedOutput returns when the launcher exits.
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		_, _ = fmt.Fprintf(sess, "failed to run subprocess: %v\r\n", err)
 		return
 	}
 
-	// Wait until the first line of output is produced, which is treated
-	// as a readiness signal from the subprocess.
-	scanner := bufio.NewScanner(reader)
-	if scanner.Scan() {
-		_, _ = fmt.Fprintf(sess, "%s\n", scanner.Text())
-	}
+	// Forward the launcher's output to the SSH client.
+	_, _ = sess.Write(output)
 
-	// Close pipes to release resources and unblock writers.
-	_ = writer.Close()
-	_ = reader.Close()
-
-	// Exit the current session; the subprocess is expected to take over.
+	// Exit the current session after the tsshd startup result is reported.
 	_ = sess.Exit(0)
-
-	// Reap the intermediate subprocess.
-	_ = cmd.Wait()
 }
 
 // Format net.Addr into "host port" form compatible with SSH_CONNECTION.

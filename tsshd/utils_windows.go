@@ -38,6 +38,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/Microsoft/go-winio"
 	"github.com/UserExistsError/conpty"
@@ -70,6 +71,10 @@ func (p *safeConPty) Resize(width, height int) error {
 	return p.ConPty.Resize(width, height)
 }
 
+func (p *tsshdPty) getPgid() (int, error) {
+	return 0, nil
+}
+
 type tsshdPty struct {
 	spty   *safeConPty
 	stdin  io.WriteCloser
@@ -93,10 +98,10 @@ func (p *tsshdPty) GetExitCode() int {
 }
 
 func (p *tsshdPty) Resize(cols, rows int) error {
-	if cols < 2 || rows < 1 {
+	if cols < 1 || rows < 1 {
 		return fmt.Errorf("terminal size (%d, %d) is too small", cols, rows)
 	}
-	return p.spty.Resize(cols-1, rows)
+	return p.spty.Resize(cols, rows)
 }
 
 func (p *tsshdPty) Redraw() error {
@@ -111,7 +116,7 @@ func newTsshdPty(cmd *exec.Cmd, cols, rows int) (*tsshdPty, error) {
 		}
 		cmdLine.WriteString(windows.EscapeArg(arg))
 	}
-	cpty, err := conpty.Start(cmdLine.String(), conpty.ConPtyDimensions(cols-1, rows), conpty.ConPtyEnv(cmd.Env))
+	cpty, err := conpty.Start(cmdLine.String(), conpty.ConPtyDimensions(cols, rows), conpty.ConPtyEnv(cmd.Env))
 	if err != nil {
 		return nil, err
 	}
@@ -220,4 +225,81 @@ func getSocketPath(pid int) (string, error) {
 func connectSocket(path string) (net.Conn, error) {
 	timeout := 1 * time.Second
 	return winio.DialPipe(path, &timeout)
+}
+
+func getProcInfos() (map[int]*procInfo, error) {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return nil, fmt.Errorf("CreateToolhelp32Snapshot failed: %v", err)
+	}
+	defer windows.CloseHandle(snapshot)
+
+	var pe32 windows.ProcessEntry32
+	pe32.Size = uint32(unsafe.Sizeof(pe32))
+
+	err = windows.Process32First(snapshot, &pe32)
+	if err != nil {
+		return nil, fmt.Errorf("Process32First failed: %v", err)
+	}
+
+	procs := make(map[int]*procInfo)
+
+	for err == nil {
+		pid := int(pe32.ProcessID)
+		ppid := int(pe32.ParentProcessID)
+		name := windows.UTF16ToString(pe32.ExeFile[:])
+
+		procs[pid] = &procInfo{
+			pid:  pid,
+			ppid: ppid,
+			name: name,
+		}
+
+		err = windows.Process32Next(snapshot, &pe32)
+	}
+
+	if err != windows.ERROR_NO_MORE_FILES {
+		return nil, fmt.Errorf("Process32Next failed: %v", err)
+	}
+
+	return procs, nil
+}
+
+func getForegroundProcess(_ int) (string, error) {
+	procs, err := getProcInfos()
+	if err != nil {
+		return "", err
+	}
+
+	procs = findAllDescendants(procs, os.Getpid())
+
+	leaves := findLeafProcesses(procs)
+
+	var best *procInfo
+
+out:
+	for _, p := range leaves {
+		for p.name == "conhost.exe" {
+			if parent, ok := procs[p.ppid]; ok {
+				p = parent
+			} else {
+				continue out
+			}
+		}
+
+		if best == nil {
+			best = p
+			continue
+		}
+
+		if p.pid > best.pid {
+			best = p
+		}
+	}
+
+	if best != nil {
+		return best.name, nil
+	}
+
+	return "", fmt.Errorf("no leaf process")
 }

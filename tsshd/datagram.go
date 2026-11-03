@@ -393,19 +393,19 @@ func (s *sshUdpServer) handleDialUdpEvent(stream Stream) {
 		return
 	}
 
-	if v := strings.ToLower(getSshdConfig("AllowTcpForwarding")); v == "no" || v == "remote" {
+	if v := getSshdConfig("AllowTcpForwarding"); strings.EqualFold(v, "no") || strings.EqualFold(v, "remote") {
 		sendProhibited(stream, "AllowTcpForwarding")
 		return
 	}
 
 	if msg.Net == "unixgram" {
-		if v := strings.ToLower(getSshdConfig("AllowStreamLocalForwarding")); v == "no" || v == "remote" {
+		if v := getSshdConfig("AllowStreamLocalForwarding"); strings.EqualFold(v, "no") || strings.EqualFold(v, "remote") {
 			sendProhibited(stream, "AllowStreamLocalForwarding")
 			return
 		}
 	}
 
-	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
+	if strings.EqualFold(getSshdConfig("DisableForwarding"), "yes") {
 		sendProhibited(stream, "DisableForwarding")
 		return
 	}
@@ -687,19 +687,19 @@ func (s *sshUdpServer) handleListenUdpEvent(stream Stream) {
 		return
 	}
 
-	if v := strings.ToLower(getSshdConfig("AllowTcpForwarding")); v == "no" || v == "local" {
+	if v := getSshdConfig("AllowTcpForwarding"); strings.EqualFold(v, "no") || strings.EqualFold(v, "local") {
 		sendProhibited(stream, "AllowTcpForwarding")
 		return
 	}
 
 	if msg.Net == "unixgram" {
-		if v := strings.ToLower(getSshdConfig("AllowStreamLocalForwarding")); v == "no" || v == "local" {
+		if v := getSshdConfig("AllowStreamLocalForwarding"); strings.EqualFold(v, "no") || strings.EqualFold(v, "local") {
 			sendProhibited(stream, "AllowStreamLocalForwarding")
 			return
 		}
 	}
 
-	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
+	if strings.EqualFold(getSshdConfig("DisableForwarding"), "yes") {
 		sendProhibited(stream, "DisableForwarding")
 		return
 	}

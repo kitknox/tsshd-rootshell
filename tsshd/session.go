@@ -52,6 +52,8 @@ var maxPendingOutputLines = 1000
 var discardMarkerCurrentIndex uint32
 var discardMarkerIndexMutex sync.Mutex
 
+var outputForwardTimeout = 5 * time.Second
+
 func (s *sshUdpServer) enablePendingInputDiscard() {
 	if s.keepPendingInput.Load() {
 		return
@@ -168,8 +170,22 @@ func (c *sessionContext) StartPty() error {
 	if err != nil {
 		return fmt.Errorf("shell pty start failed: %v", err)
 	}
+
+	// Closing the PTY master does not always unblock a blocked Read immediately.
+	// Use a pipe so the output forwarder can be interrupted by closing the pipe
+	// reader instead of depending on the PTY master's Read behavior.
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("pty stdout pipe failed: %v", err)
+	}
+
+	go func() {
+		_, _ = io.Copy(stdoutWriter, c.pty.stdout)
+		_ = stdoutWriter.Close()
+	}()
+
 	c.stdin = c.pty.stdin
-	c.stdout = c.pty.stdout
+	c.stdout = stdoutReader
 	c.started = true
 	debug("session [%d] start pty success", c.id)
 	return nil
@@ -180,16 +196,40 @@ func (c *sessionContext) StartCmd() error {
 	if c.stdin, err = c.cmd.StdinPipe(); err != nil {
 		return fmt.Errorf("cmd stdin pipe failed: %v", err)
 	}
-	if c.stdout, err = c.cmd.StdoutPipe(); err != nil {
+
+	// Do not use cmd.StdoutPipe and cmd.StderrPipe here. exec.Cmd.Wait closes
+	// the pipes it creates, which can discard output that has not been forwarded
+	// yet. Create the pipes ourselves so the remaining output can still be read
+	// and forwarded after the child process exits.
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
 		return fmt.Errorf("cmd stdout pipe failed: %v", err)
 	}
-	if c.stderr, err = c.cmd.StderrPipe(); err != nil {
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
 		return fmt.Errorf("cmd stderr pipe failed: %v", err)
 	}
+
+	// The write sides are inherited by the child process. Close the copies held
+	// by the parent process in all cases; otherwise the read sides won't reach
+	// EOF and the file descriptors will leak if the command fails to start.
+	defer func() {
+		_ = stdoutWriter.Close()
+		_ = stderrWriter.Close()
+	}()
+
+	c.cmd.Stdout, c.cmd.Stderr = stdoutWriter, stderrWriter
+
 	if err := c.cmd.Start(); err != nil {
+		_ = stdoutReader.Close()
+		_ = stderrReader.Close()
 		return fmt.Errorf("start cmd %v failed: %v", c.cmd.Args, err)
 	}
-	c.started = true
+
+	c.stdout, c.stderr, c.started = stdoutReader, stderrReader, true
+
 	debug("session [%d] start cmd success", c.id)
 	return nil
 }
@@ -296,7 +336,7 @@ func (c *sessionContext) isKeepPendingOutput() bool {
 	return false
 }
 
-func (c *sessionContext) newOutputForwarder(name string, reader io.Reader, stream Stream) *serverOutputForwarder {
+func (c *sessionContext) newOutputForwarder(name string, reader io.ReadCloser, stream Stream) *serverOutputForwarder {
 	return &serverOutputForwarder{
 		name:       name,
 		sess:       c,
@@ -304,6 +344,15 @@ func (c *sessionContext) newOutputForwarder(name string, reader io.Reader, strea
 		stream:     stream,
 		done:       make(chan struct{}),
 		writeBufCh: make(chan []byte, 1),
+	}
+}
+
+func (c *sessionContext) onReconnected() {
+	if c.outForwarder != nil {
+		go c.outForwarder.onReconnected()
+	}
+	if c.errForwarder != nil {
+		go c.errForwarder.onReconnected()
 	}
 }
 
@@ -340,28 +389,6 @@ func (c *sessionContext) forwardIO(server *sshUdpServer, ioStream, errStream Str
 }
 
 func (c *sessionContext) Wait() {
-	// windows pty only close the stdout in pty.Wait
-	if runtime.GOOS == "windows" && c.mwSess == nil && c.pty != nil {
-		_ = c.pty.Wait()
-		c.outWG.Wait()
-		debug("session [%d] wait completed", c.id)
-		return
-	}
-
-	done := make(chan struct{})
-	go func() {
-		c.outWG.Wait() // wait for the output first to prevent cmd.Wait close output too early
-		close(done)
-		if c.screenBuf != nil {
-			close(c.screenBuf)
-		}
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-	}
-
 	if c.mwSess != nil {
 		_ = c.mwSess.Wait()
 	} else if c.pty != nil {
@@ -370,13 +397,25 @@ func (c *sessionContext) Wait() {
 		_ = c.cmd.Wait()
 	}
 
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		warning("child process has exited, but output streams did not close in time")
+	debug("session [%d] process wait completed", c.id)
+
+	var warnOnce sync.Once
+	if c.outForwarder != nil {
+		c.outForwarder.abortIfTimeout(outputForwardTimeout, &warnOnce)
+	}
+	if c.errForwarder != nil {
+		c.errForwarder.abortIfTimeout(outputForwardTimeout, &warnOnce)
 	}
 
-	debug("session [%d] wait completed", c.id)
+	c.outWG.Wait()
+
+	// Close screenBuf only after all output forwarders have finished, because
+	// they may still write to it while draining the remaining process output.
+	if c.screenBuf != nil {
+		close(c.screenBuf)
+	}
+
+	debug("session [%d] output wait completed", c.id)
 }
 
 func (c *sessionContext) Close() {
@@ -418,6 +457,13 @@ func (c *sessionContext) Close() {
 			_ = c.cmd.Process.Kill()
 			debug("session [%d] cmd killed", c.id)
 		}
+	}
+
+	if c.ioStream != nil {
+		_ = c.ioStream.Close()
+	}
+	if c.errStream != nil {
+		_ = c.errStream.Close()
 	}
 }
 
@@ -549,8 +595,14 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 	}
 	var errStream Stream
 	if es := s.takeStderrStream(errID); es != nil {
-		defer func() { _ = es.Close() }()
-		errStream = es
+		var err error
+		errStream, err = compressOutput(msg.Compression, es)
+		if err != nil {
+			_ = es.Close()
+			sendError(stream, fmt.Errorf("compress stderr failed: %v", err))
+			return
+		}
+		defer func() { _ = errStream.Close() }()
 	} else {
 		errStream = &discardStream{}
 	}
@@ -589,17 +641,28 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 		return
 	}
 
+	outStream, err := compressOutput(msg.Compression, stream)
+	if err != nil {
+		sendError(stream, fmt.Errorf("compress stdout failed: %v", err))
+		sess.Close()
+		return
+	}
+	if msg.Compression != "" {
+		debug("session [%d] output compressed with %s", msg.ID, msg.Compression)
+	}
+
 	if err := sendSuccess(stream); err != nil { // ack ok
 		warning("start session ack ok failed: %v", err)
+		_ = outStream.Close()
 		sess.Close()
 		return
 	}
 
 	if sess.mwSess == nil && msg.Shell {
-		sess.showMotd(stream)
+		sess.showMotd(outStream)
 	}
 
-	sess.forwardIO(s, stream, errStream)
+	sess.forwardIO(s, outStream, errStream)
 
 	if s.args.Attachable {
 		// Each session is started only once since duplicate session IDs are rejected,
@@ -927,7 +990,9 @@ func (s *sshUdpServer) handleResizeEvent(stream Stream) error {
 	sess := getSessionByID(msg.ID)
 
 	if sess == nil {
-		return fmt.Errorf("session [%d] not found", msg.ID)
+		// For short-lived commands (e.g., tssh --kcp xxx 'exit 0'), the session may have already exited.
+		debug("resize failed: session [%d] not found", msg.ID)
+		return nil
 	}
 
 	// Serialize with attach operations to ensure the session is still owned
@@ -956,11 +1021,11 @@ func (c *sessionContext) handleX11Request(msg *startMessage) {
 		return
 	}
 
-	if v := strings.ToLower(getSshdConfig("X11Forwarding")); v != "yes" {
+	if !strings.EqualFold(getSshdConfig("X11Forwarding"), "yes") {
 		warning("X11Forwarding is not permitted on the server. Check [X11Forwarding] in [%s] on the server.", sshdConfigPath)
 		return
 	}
-	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
+	if strings.EqualFold(getSshdConfig("DisableForwarding"), "yes") {
 		warning("X11Forwarding is not permitted on the server. Check [DisableForwarding] in [%s] on the server.", sshdConfigPath)
 		return
 	}
@@ -972,7 +1037,7 @@ func (c *sessionContext) handleX11Request(msg *startMessage) {
 		}
 	}
 
-	useLocalhost := strings.ToLower(getSshdConfig("X11UseLocalhost")) != "no"
+	useLocalhost := !strings.EqualFold(getSshdConfig("X11UseLocalhost"), "no")
 	listeners, port, err := listenTcpOnFreePort(useLocalhost, 6000+displayOffset, min(6000+displayOffset+1000, 65535))
 	if err != nil {
 		warning("X11 forwarding listen failed: %v", err)
@@ -1135,11 +1200,11 @@ func (c *sessionContext) handleAgentRequest(msg *startMessage) {
 		return
 	}
 
-	if v := strings.ToLower(getSshdConfig("AllowAgentForwarding")); v == "no" {
+	if strings.EqualFold(getSshdConfig("AllowAgentForwarding"), "no") {
 		warning("AgentForwarding is not permitted on the server. Check [AllowAgentForwarding] in [%s] on the server.", sshdConfigPath)
 		return
 	}
-	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
+	if strings.EqualFold(getSshdConfig("DisableForwarding"), "yes") {
 		warning("AgentForwarding is not permitted on the server. Check [DisableForwarding] in [%s] on the server.", sshdConfigPath)
 		return
 	}
