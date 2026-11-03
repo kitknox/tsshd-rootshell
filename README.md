@@ -1,10 +1,12 @@
 # tsshd — rootshell fork
 
 This repository is the [rootshell](https://www.rootshell.com)-maintained fork
-of [trzsz/tsshd](https://github.com/trzsz/tsshd). It adds transport lifecycle,
-health and statistics reporting, and datagram-forwarding support used by
-rootshell's `tssh` integration. The fork is maintained independently and does
-not automatically track subsequent upstream changes.
+of [trzsz/tsshd](https://github.com/trzsz/tsshd). It adds dial hooks for
+routing the transport through an in-app network, a packet size cap, abandoning
+a client without ending its sessions, ending a session by id, and PTY sizing
+for exec commands, all used by rootshell's `tssh` integration. The fork is
+maintained independently and does not automatically track subsequent upstream
+changes.
 
 The `tsshd` command name and Go module path remain unchanged. Report rootshell
 application problems in the
