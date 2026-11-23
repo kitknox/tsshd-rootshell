@@ -26,6 +26,7 @@ package tsshd
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -40,7 +41,7 @@ import (
 )
 
 func TestKCP_PassSaltValidation(t *testing.T) {
-	opts := &UdpClientOptions{ServerInfo: &ServerInfo{}}
+	opts := &UdpClientOptions{ServerInfo: &ServerInfo{ProtoVer: kTsshdProtocol}}
 	svrConn := listenRandomUDP(t)
 	defer func() { _ = svrConn.Close() }()
 
@@ -49,6 +50,7 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newKcpServerCrypto failed: %v", err)
 	}
+	setTestClientHello(t, crypto)
 	listener, err := listenKCP(svrConn, crypto)
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
@@ -124,10 +126,11 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 		// We intentionally do NOT assert failure here.
 		cliConn1 := listenRandomUDP(t)
 		defer func() { _ = cliConn1.Close() }()
-		illegalOpts := &UdpClientOptions{ServerInfo: &ServerInfo{Pass: opts.ServerInfo.Salt, Salt: opts.ServerInfo.Pass}}
+		illegalOpts := &UdpClientOptions{ServerInfo: &ServerInfo{
+			ProtoVer: kTsshdProtocol, Pass: opts.ServerInfo.Salt, Salt: opts.ServerInfo.Pass}}
 		illegalClient, err := newKcpClient(illegalOpts, nil, cliConn1, svrConn.LocalAddr())
 		if err == nil {
-			defer func() { _ = illegalClient.closeClient() }()
+			defer func() { _ = illegalClient.Close() }()
 			// Try to open a smux stream with a short timeout.
 			// If this unexpectedly succeeds, it will consume the server's
 			// single Accept slot and cause Case 2 to fail, exposing a bug.
@@ -144,7 +147,7 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 			clientErrCh <- fmt.Errorf("valid pass/salt should succeed: %v", err)
 			return
 		}
-		defer func() { _ = client.closeClient() }()
+		defer func() { _ = client.Close() }()
 
 		// open stream and verify echo
 		stream, err := doWithTimeout(func() (*smux.Stream, error) {
@@ -168,7 +171,7 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 			return
 		}
 		if !bytes.Equal(data, echo) {
-			clientErrCh <- fmt.Errorf("echo mismatch")
+			clientErrCh <- errors.New("echo mismatch")
 			return
 		}
 	}()
@@ -189,7 +192,7 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 }
 
 func TestKCP_OOB(t *testing.T) {
-	opts := &UdpClientOptions{ServerInfo: &ServerInfo{}}
+	opts := &UdpClientOptions{ServerInfo: &ServerInfo{ProtoVer: kTsshdProtocol}}
 	svrConn := listenRandomUDP(t)
 	defer func() { _ = svrConn.Close() }()
 
@@ -198,6 +201,7 @@ func TestKCP_OOB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newKcpServerCrypto failed: %v", err)
 	}
+	setTestClientHello(t, crypto)
 	listener, err := listenKCP(svrConn, crypto)
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
@@ -326,10 +330,27 @@ func TestKCP_OOB(t *testing.T) {
 	})
 
 	wg.Go(func() {
-		// send OOB data of varying lengths in a loop, content is [0,1,2,...]
-		for i := range 5 << 20 {
-			if err := client.conn.SendOOB(data[:i%sizePlus1]); err != nil {
-				t.Errorf("client failed to send OOB payload: %v", err)
+		for range 1000 {
+			// send OOB data of varying lengths in a loop, content is [0,1,2,...]
+			for i := range 5 * sizePlus1 {
+				j := i % sizePlus1
+				if counts[j].Load() > 0 {
+					continue
+				}
+				if err := client.conn.SendOOB(data[:j]); err != nil {
+					t.Errorf("client failed to send OOB payload: %v", err)
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+			var missing bool
+			for i := range counts {
+				if counts[i].Load() == 0 {
+					missing = true
+					break
+				}
+			}
+			if !missing {
+				break
 			}
 		}
 		oobDone.Store(true)
@@ -351,6 +372,15 @@ func TestKCP_OOB(t *testing.T) {
 		if counts[i].Load() == 0 {
 			t.Errorf("missing OOB echo for payload length %d", i)
 		}
+	}
+}
+
+// setTestClientHello stands in for the proxy authentication, which is skipped
+// by the tests that connect a KCP client to a KCP listener directly.
+func setTestClientHello(t *testing.T, crypto *rotatingCrypto) {
+	t.Helper()
+	if err := crypto.setClientHello(kTsshdProtocol, 0, nil); err != nil {
+		t.Fatalf("setClientHello failed: %v", err)
 	}
 }
 
@@ -398,6 +428,11 @@ func runKcpEchoTest(t *testing.T, listener *kcp.Listener, client *kcpClient) {
 				return
 			}
 		}
+
+		// Keep the connection open until the client has verified the last echo.
+		if _, err := stream.Read(buf); err != io.EOF {
+			serverErrCh <- fmt.Errorf("expected the client to close the stream, got: %v", err)
+		}
 	}()
 
 	// ---------- client ----------
@@ -437,22 +472,28 @@ func runKcpEchoTest(t *testing.T, listener *kcp.Listener, client *kcpClient) {
 		}
 	}()
 
-	select {
-	case err := <-serverErrCh:
-		if err != nil {
-			t.Fatalf("server error: %v", err)
+	// Wait for both sides, so that the client has verified every echo.
+	timeout := time.After(3 * time.Second)
+	for serverErrCh != nil || clientErrCh != nil {
+		select {
+		case err, ok := <-serverErrCh:
+			if ok {
+				t.Fatalf("server error: %v", err)
+			}
+			serverErrCh = nil
+		case err, ok := <-clientErrCh:
+			if ok {
+				t.Fatalf("client error: %v", err)
+			}
+			clientErrCh = nil
+		case <-timeout:
+			t.Fatalf("kcp echo test timeout")
 		}
-	case err := <-clientErrCh:
-		if err != nil {
-			t.Fatalf("client error: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("kcp echo test timeout")
 	}
 }
 
 func TestKCP_EchoBasic(t *testing.T) {
-	opts := &UdpClientOptions{ServerInfo: &ServerInfo{}}
+	opts := &UdpClientOptions{ServerInfo: &ServerInfo{ProtoVer: kTsshdProtocol}}
 
 	svrConn := listenRandomUDP(t)
 	defer func() { _ = svrConn.Close() }()
@@ -461,6 +502,7 @@ func TestKCP_EchoBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newKcpServerCrypto failed: %v", err)
 	}
+	setTestClientHello(t, crypto)
 	listener, err := listenKCP(svrConn, crypto)
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
@@ -474,7 +516,7 @@ func TestKCP_EchoBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newKcpClient failed: %v", err)
 	}
-	defer func() { _ = client.closeClient() }()
+	defer func() { _ = client.Close() }()
 
 	runKcpEchoTest(t, listener, client)
 }
@@ -509,7 +551,7 @@ func (p *proxyWithCrypto) SetReadDeadline(t time.Time) error  { return p.conn.Se
 func (p *proxyWithCrypto) SetWriteDeadline(t time.Time) error { return p.conn.SetWriteDeadline(t) }
 
 func TestKCP_DelegatedCrypto(t *testing.T) {
-	opts := &UdpClientOptions{ServerInfo: &ServerInfo{}}
+	opts := &UdpClientOptions{ServerInfo: &ServerInfo{ProtoVer: kTsshdProtocol}}
 
 	svrConn := listenRandomUDP(t)
 	defer func() { _ = svrConn.Close() }()
@@ -520,10 +562,8 @@ func TestKCP_DelegatedCrypto(t *testing.T) {
 		t.Fatalf("newKcpServerCrypto failed: %v", err)
 	}
 
-	proxy.crypto, err = newRotatingCrypto(nil, crypto.keyPass, crypto.keySalt, 0, 0, false)
-	if err != nil {
-		t.Fatalf("newRotatingCrypto failed: %v", err)
-	}
+	proxy.crypto = newServerCrypto(crypto.keyPass, crypto.keySalt, false)
+	setTestClientHello(t, proxy.crypto)
 
 	listener, err := listenKCP(proxy, crypto)
 	if err != nil {
@@ -531,18 +571,22 @@ func TestKCP_DelegatedCrypto(t *testing.T) {
 	}
 	defer func() { _ = listener.Close() }()
 
-	oriClientDebugFn, oriEnableDebugLogging := clientDebugFn, enableDebugLogging
-	defer func() { clientDebugFn, enableDebugLogging = oriClientDebugFn, oriEnableDebugLogging }()
+	oriClientDebugFn, oriEnableDebugLogging := clientDebugFn.Load(), enableDebugLogging.Load()
+	defer func() {
+		clientDebugFn.Store(oriClientDebugFn)
+		enableDebugLogging.Store(oriEnableDebugLogging)
+	}()
 
 	var debugCalled, kcpMemUnexpected atomic.Bool
-	clientDebugFn = func(_ int64, msg string) {
+	debugFn := func(_ int64, msg string) {
 		debugCalled.Store(true)
 		if strings.Contains(msg, kcpMemLayoutUnexpected) {
 			kcpMemUnexpected.Store(true)
 		}
 	}
+	clientDebugFn.Store(&debugFn)
 
-	enableDebugLogging = true
+	enableDebugLogging.Store(true)
 	debug("call clientDebugFn")
 	if !debugCalled.Load() {
 		t.Fatalf("expected clientDebugFn to be called but it was not")
@@ -555,11 +599,95 @@ func TestKCP_DelegatedCrypto(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newKcpClient failed: %v", err)
 	}
-	defer func() { _ = client.closeClient() }()
+	defer func() { _ = client.Close() }()
 
 	runKcpEchoTest(t, listener, client)
 
 	if kcpMemUnexpected.Load() {
 		t.Fatalf("unexpected KCP crypto memory layout detected")
+	}
+}
+
+type reflectedPacket struct {
+	buf  []byte
+	addr net.Addr
+}
+
+// reflectingConn sends every packet written by the server back to the server,
+// as if it came from the client address, like someone who can observe the
+// traffic and spoof the client address would do.
+type reflectingConn struct {
+	net.PacketConn
+	packets chan reflectedPacket
+	// reflecting is true while the server handles a reflected packet. The
+	// KCP listener reads and opens the packets one by one in a single loop.
+	reflecting atomic.Bool
+	reflected  atomic.Int64
+	accepted   atomic.Int64
+}
+
+func (c *reflectingConn) ReadFrom(buf []byte) (int, net.Addr, error) {
+	select {
+	case packet := <-c.packets:
+		c.reflecting.Store(true)
+		c.reflected.Add(1)
+		return copy(buf, packet.buf), packet.addr, nil
+	default:
+		c.reflecting.Store(false)
+		return c.PacketConn.ReadFrom(buf)
+	}
+}
+
+func (c *reflectingConn) WriteTo(buf []byte, addr net.Addr) (int, error) {
+	select {
+	case c.packets <- reflectedPacket{bytes.Clone(buf), addr}:
+	default:
+	}
+	return c.PacketConn.WriteTo(buf, addr)
+}
+
+// onPacketAccepted is called by the server crypto for every packet it accepts.
+func (c *reflectingConn) onPacketAccepted() {
+	if c.reflecting.Load() {
+		c.accepted.Add(1)
+	}
+}
+
+func TestKCP_RejectReflectedPackets(t *testing.T) {
+	opts := &UdpClientOptions{ServerInfo: &ServerInfo{ProtoVer: kTsshdProtocol}}
+
+	svrConn := &reflectingConn{PacketConn: listenRandomUDP(t), packets: make(chan reflectedPacket, 1024)}
+	defer func() { _ = svrConn.Close() }()
+
+	crypto, err := newKcpServerCrypto(opts.ServerInfo, false)
+	if err != nil {
+		t.Fatalf("newKcpServerCrypto failed: %v", err)
+	}
+	setTestClientHello(t, crypto)
+	crypto.onPacketAccepted = svrConn.onPacketAccepted
+
+	listener, err := listenKCP(svrConn, crypto)
+	if err != nil {
+		t.Fatalf("listenKCP failed: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	cliConn := listenRandomUDP(t)
+	defer func() { _ = cliConn.Close() }()
+
+	client, err := newKcpClient(opts, nil, cliConn, svrConn.LocalAddr())
+	if err != nil {
+		t.Fatalf("newKcpClient failed: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	// The echo is corrupted if the server takes its own packets as client input.
+	runKcpEchoTest(t, listener, client)
+
+	if svrConn.reflected.Load() == 0 {
+		t.Fatal("no packet was reflected to the server")
+	}
+	if accepted := svrConn.accepted.Load(); accepted != 0 {
+		t.Fatalf("server accepted %d of its own %d reflected packets", accepted, svrConn.reflected.Load())
 	}
 }

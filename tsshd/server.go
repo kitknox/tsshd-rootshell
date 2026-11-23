@@ -25,6 +25,7 @@ SOFTWARE.
 package tsshd
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -36,6 +37,12 @@ var activeSshUdpServer atomic.Pointer[sshUdpServer]
 
 type streamHandler interface {
 	handleStream(stream Stream)
+}
+
+type clientPathExpiry struct {
+	aliveTime int64
+	deadline  time.Time
+	cleanup   func(string)
 }
 
 type sshUdpServer struct {
@@ -55,10 +62,17 @@ type sshUdpServer struct {
 	clientChecker *timeoutChecker
 
 	// bus related
-	serving         atomic.Bool
-	busMutex        sync.Mutex
-	busStream       Stream
+	serving   atomic.Bool
+	busMutex  sync.Mutex
+	busStream Stream
+
+	// clientAliveTime records the last time the server received a heartbeat from the client
+	// over the KCP/QUIC stream. It is not updated by arbitrary incoming UDP datagrams.
 	clientAliveTime atomic.Int64
+
+	// pendingPathExpiry tracks a pending expiration of the proxy-side client path.
+	// It is accessed only by the server liveness monitor.
+	pendingPathExpiry *clientPathExpiry
 
 	// session related
 	stderrMutex       sync.Mutex
@@ -123,24 +137,34 @@ var newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, p
 func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 	s.clientChecker = newTimeoutChecker(timeout)
 
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		s.clientChecker.onTimeout(func() {
 			debug("blocked due to no client [%x] input for [%v]", s.client.proxyAddr.clientID, s.clientChecker.heartbeatTimeout)
+			if traffic := s.client.udpTraffic.Load(); traffic != nil && !traffic.recFlag.Load() {
+				traffic.resetStats()
+				traffic.recFlag.Store(true)
+			}
 		})
 		s.clientChecker.onReconnected(func() {
 			debug("resumed after receiving client [%x] input", s.client.proxyAddr.clientID)
 			time.AfterFunc(10*time.Second, func() {
 				if !s.clientChecker.isTimeout() {
-					s.client.udpTraffic.recFlag.Store(false)
+					if traffic := s.client.udpTraffic.Load(); traffic != nil {
+						traffic.recFlag.Store(false)
+					}
 				}
 			})
 		})
 	}
 
 	s.clientChecker.onTimeout(func() {
-		oldAuthedAddr := s.client.authedAddr.Load()
-		oldClientAddr := s.client.clientAddr.Load()
-		oldClientConn := s.client.clientConn.Load()
+		// Clear the proxy-side client path when no UDP packets are received,
+		// to prevent another peer from inheriting the client's authentication
+		// if its NAT mapping expires.
+		cleanup := s.captureClientPathCleanup()
+		if cleanup == nil {
+			return
+		}
 
 		// A reconnect may happen concurrently with this timeout callback.
 		// The transport loaded above may already belong to the new connection.
@@ -156,19 +180,9 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 			return
 		}
 
-		// Clear authenticated UDP client addresses to prevent the UDP endpoint
-		// from being reused by another peer after timeout.
-		s.client.setAuthedAddr(oldAuthedAddr, nil)
-		s.client.setClientAddr(oldClientAddr, nil)
-		// Also proactively close the TCP connection to ensure it cannot be
-		// reused or remain in a half-open state after the client times out.
-		s.client.setClientConn(oldClientConn, nil)
-		debug("client [%x] transport cleared due to timeout", s.client.proxyAddr.clientID)
-
-		if enableDebugLogging && !s.client.udpTraffic.recFlag.Load() {
-			s.client.udpTraffic.resetStats()
-			s.client.udpTraffic.recFlag.Store(true)
-		}
+		// Remove the old authenticated path so a new owner of the same NAT
+		// endpoint cannot inherit the client's authentication.
+		cleanup("no UDP packets received")
 	})
 
 	// Notify all sessions currently attached to this server when the client
@@ -195,7 +209,7 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 	debug("client [%x] starting server activation", s.client.proxyAddr.clientID)
 	if !s.args.Attachable {
 		if !activeSshUdpServer.CompareAndSwap(nil, s) {
-			return fmt.Errorf("active server is already in use")
+			return errors.New("active server is already in use")
 		}
 		s.client.server.Store(s)
 		s.serving.Store(true)
@@ -209,7 +223,7 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 	defer attachMutex.Unlock()
 
 	if busClosing.Load() {
-		return fmt.Errorf("bus is closed")
+		return errors.New("bus is closed")
 	}
 
 	oldServer := activeSshUdpServer.Swap(s)
@@ -280,7 +294,7 @@ func (s *sshUdpServer) Close() {
 	debug("client [%x] all streams closed", s.client.proxyAddr.clientID)
 
 	// close server connection
-	err := s.proto.closeServer()
+	err := s.proto.Close()
 	debug("client [%x] transport closed: %v", s.client.proxyAddr.clientID, err)
 
 	// The clientState is kept in memory to prevent replay attacks.
@@ -353,7 +367,7 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 		return
 	}
 
-	if enableDebugLogging && command != "dial" && command != "accept" && command != "dial-udp" && command != "accept-udp" {
+	if enableDebugLogging.Load() && command != "dial" && command != "accept" && command != "dial-udp" && command != "accept-udp" {
 		debug("stream [%x][%d] command [%s] starts", s.client.proxyAddr.clientID, id, command)
 		defer debug("stream [%x][%d] command [%s] closing", s.client.proxyAddr.clientID, id, command)
 	}
@@ -368,11 +382,11 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 	} else {
 		// Other streams require bus initialization and that this server is the active instance.
 		if !s.serving.Load() {
-			sendError(stream, fmt.Errorf("bus must be initialized first"))
+			sendError(stream, errors.New("bus must be initialized first"))
 			return
 		}
 		if server := activeSshUdpServer.Load(); server != s {
-			sendError(stream, fmt.Errorf("not the active server instance"))
+			sendError(stream, errors.New("not the active server instance"))
 			return
 		}
 	}
@@ -433,4 +447,89 @@ func (s *sshUdpServer) closeActiveStreams() {
 
 func (s *sshUdpServer) isClientAlive() bool {
 	return time.Since(time.UnixMilli(s.clientAliveTime.Load())) < s.clientChecker.heartbeatTimeout
+}
+
+func (s *sshUdpServer) captureClientPathCleanup() func(reason string) {
+	oldAuthedAddr := s.client.authedAddr.Load()
+	oldClientAddr := s.client.clientAddr.Load()
+	oldClientConn := s.client.clientConn.Load()
+
+	if oldAuthedAddr == nil && oldClientAddr == nil && oldClientConn == nil {
+		return nil
+	}
+
+	return func(reason string) {
+		if oldAuthedAddr != nil && oldAuthedAddr == s.client.authedAddr.Load() {
+			debug("client [%x] clearing authed addr due to %s", s.client.proxyAddr.clientID, reason)
+			s.client.setAuthedAddr(oldAuthedAddr, nil)
+		}
+		if oldClientAddr != nil && oldClientAddr == s.client.clientAddr.Load() {
+			debug("client [%x] clearing client addr due to %s", s.client.proxyAddr.clientID, reason)
+			s.client.setClientAddr(oldClientAddr, nil)
+		}
+		if oldClientConn != nil && oldClientConn == s.client.clientConn.Load() {
+			debug("client [%x] clearing client conn due to %s", s.client.proxyAddr.clientID, reason)
+			s.client.setClientConn(oldClientConn, nil)
+		}
+	}
+}
+
+// expireInactiveClientPath expires the proxy-side client path if no heartbeat
+// has been received over the KCP/QUIC stream for a prolonged period.
+//
+// The proxy's client checker only tracks incoming UDP datagrams. Spoofed
+// UDP datagrams can keep it alive without producing valid KCP/QUIC stream
+// heartbeats. Meanwhile, the legitimate client's NAT mapping may expire,
+// allowing its public UDP endpoint (IP:port) to be reassigned to another
+// peer. If the old authenticated endpoint is retained, the new owner may
+// be treated as the authenticated client by the proxy, causing server
+// replies to be sent to the wrong peer.
+//
+// Tracking clientAliveTime independently prevents spoofed UDP datagrams
+// from indefinitely extending the lifetime of the proxy-side client path.
+func (s *sshUdpServer) expireInactiveClientPath() {
+	checker := s.clientChecker
+	if checker == nil || checker.heartbeatTimeout <= 0 {
+		s.pendingPathExpiry = nil
+		return
+	}
+
+	now := time.Now()
+	aliveTime := s.clientAliveTime.Load()
+	timeout := 3 * checker.heartbeatTimeout
+
+	if now.Sub(time.UnixMilli(aliveTime)) <= timeout {
+		s.pendingPathExpiry = nil
+		return
+	}
+
+	state := s.pendingPathExpiry
+	if state == nil || state.aliveTime != aliveTime {
+		cleanup := s.captureClientPathCleanup()
+		if cleanup == nil {
+			s.pendingPathExpiry = nil
+			return
+		}
+
+		s.pendingPathExpiry = &clientPathExpiry{
+			aliveTime: aliveTime,
+			deadline:  now.Add(timeout),
+			cleanup:   cleanup,
+		}
+		return
+	}
+
+	if now.Before(state.deadline) {
+		return
+	}
+
+	// Only expire the path if the transport has remained inactive.
+	if s.clientAliveTime.Load() == aliveTime {
+		// Clear the authenticated path so another peer cannot inherit the client's
+		// authentication after its NAT mapping expires, even if spoofed UDP datagrams
+		// keep the client checker alive.
+		state.cleanup("no stream heartbeat received")
+	}
+
+	s.pendingPathExpiry = nil
 }

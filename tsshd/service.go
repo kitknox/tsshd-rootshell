@@ -87,7 +87,7 @@ var smuxConfig = smux.Config{
 
 type protocolServer interface {
 	reset()
-	closeServer() error
+	Close() error
 	getUdpForwarder() *udpForwarder
 }
 
@@ -101,7 +101,7 @@ func (s *kcpServer) reset() {
 	s.conn.ResetRTO()
 }
 
-func (s *kcpServer) closeServer() error {
+func (s *kcpServer) Close() error {
 	s.forwarder.Close()
 	return s.session.Close()
 }
@@ -119,7 +119,7 @@ func (s *quicServer) reset() {
 	s.conn.ResetPTO()
 }
 
-func (s *quicServer) closeServer() error {
+func (s *quicServer) Close() error {
 	s.forwarder.Close()
 	return s.conn.CloseWithError(0, "")
 }
@@ -134,7 +134,7 @@ func initServer(args *tsshdArgs) (*ServerInfo, string, error) {
 		return nil, "", err
 	}
 
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		debug("tsshd listening: pid=%d, port=%d", os.Getpid(), port)
 	}
 
@@ -428,10 +428,7 @@ func newKcpServerCrypto(info *ServerInfo, delegToProxy bool) (*rotatingCrypto, e
 		return nil, fmt.Errorf("rand salt failed: %v", err)
 	}
 
-	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0, delegToProxy)
-	if err != nil {
-		return nil, fmt.Errorf("new rotating crypto failed: %w", err)
-	}
+	crypto := newServerCrypto(pass, salt, delegToProxy)
 
 	info.Mode = kUdpModeKCP
 	info.Pass = fmt.Sprintf("%x", pass)

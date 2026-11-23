@@ -26,12 +26,14 @@ package tsshd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	crypto_rand "crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -55,6 +57,16 @@ func (t *tcpServerConn) Close() error {
 
 func (t *tcpServerConn) Write(buf []byte) error {
 	return sendUdpPacket(t.conn, buf)
+}
+
+func (t *tcpServerConn) WriteWithContext(ctx context.Context, buf []byte) error {
+	if ctx.Done() == nil {
+		return sendUdpPacket(t.conn, buf)
+	}
+
+	buffer := append([]byte(nil), buf...)
+	_, err := doWithContext(ctx, func() (int, error) { return 0, sendUdpPacket(t.conn, buffer) })
+	return err
 }
 
 func (t *tcpServerConn) Read(buf []byte) (int, error) {
@@ -117,6 +129,17 @@ func (u *udpServerConn) Write(buf []byte) error {
 	return err
 }
 
+func (u *udpServerConn) WriteWithContext(ctx context.Context, buf []byte) error {
+	if ctx.Done() == nil {
+		_, err := u.conn.Write(buf)
+		return err
+	}
+
+	buffer := append([]byte(nil), buf...)
+	_, err := doWithContext(ctx, func() (int, error) { return u.conn.Write(buffer) })
+	return err
+}
+
 func (u *udpServerConn) Read(buf []byte) (int, error) {
 	return u.conn.Read(buf)
 }
@@ -151,9 +174,8 @@ type clientProxy struct {
 	cipherBlock   *cipher.Block
 	clientID      uint64
 	serverID      uint64
-	renewMutex    sync.Mutex
+	renewMutex    chan struct{}
 	serialNumber  uint64
-	kcpCrypto     *rotatingCrypto
 	serverChecker *timeoutChecker
 	closed        atomic.Bool
 	udpTraffic    *trafficStats
@@ -161,6 +183,12 @@ type clientProxy struct {
 	cumTraffic    cumulativeTraffic
 	dialTCP       func(network, addr string, timeout time.Duration) (net.Conn, error)
 	dialUDP       func(network, addr string, timeout time.Duration) (net.Conn, error)
+	// clientNonce is fresh for each client, so that the server never mistakes
+	// this client for an earlier one started with the same server info.
+	clientNonce []byte
+	// kcpAliveCheck means that KCP refreshes serverChecker itself, once a
+	// packet from the server has been authenticated and is not a replay.
+	kcpAliveCheck bool
 }
 
 // cumulativeTraffic counts UDP wire datagrams for the lifetime of the
@@ -186,36 +214,53 @@ func (p *clientProxy) clearBackendConn(oldConn *serverConnHolder) {
 	}
 }
 
-func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeout time.Duration) error {
+func (p *clientProxy) renewTransportPath(ctx context.Context, proxyClient *SshUdpClient) error {
+	select {
+	case p.renewMutex <- struct{}{}:
+		defer func() {
+			<-p.renewMutex
+		}()
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("wait for renew lock failed: %v", err)
+		}
+	case <-ctx.Done():
+		return fmt.Errorf("wait for renew lock failed: %v", ctx.Err())
+	}
 
-	p.renewMutex.Lock()
-	defer p.renewMutex.Unlock()
+	if p.closed.Load() {
+		return errors.New("client proxy closed")
+	}
+
 	p.serialNumber++
-
 	p.clearBackendConn(nil)
 
 	var err error
 	var conn *serverConnHolder
 
 	if proxyClient == nil && len(p.proxyCmds) > 0 && p.proxyMode != kProxyModeTCP {
-		return fmt.Errorf("proxy command only supports tcp proxy mode")
+		return errors.New("proxy command only supports tcp proxy mode")
 	}
 	p.client.debug("tsshd server: network=%s, address=%s", p.serverNet, p.serverAddr)
 	if p.proxyMode == kProxyModeTCP {
-		conn, err = p.renewTcpPath(proxyClient, connectTimeout)
+		conn, err = p.renewTcpPath(ctx, proxyClient)
 	} else {
-		conn, err = p.renewUdpPath(proxyClient, connectTimeout)
+		conn, err = p.renewUdpPath(ctx, proxyClient)
 	}
 	if err != nil {
 		return err
 	}
 
 	p.backendMutex.Lock()
+	if p.closed.Load() {
+		p.backendMutex.Unlock()
+		_ = conn.Close()
+		return errors.New("client proxy closed")
+	}
 	p.backendConn.Store(conn)
 	p.backendCond.Broadcast()
 	p.backendMutex.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), p.serverChecker.heartbeatTimeout)
+	subCtx, cancel := context.WithTimeout(ctx, p.serverChecker.heartbeatTimeout)
 	defer cancel()
 
 	// In UDP mode, send dummy (non-authenticated) packets to notify the server that the transport path is active.
@@ -229,10 +274,13 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 				case <-ticker.C:
 					buf := make([]byte, kSafeToDropPacketLen)
 					_, _ = crypto_rand.Read(buf)
-					if err := conn.Write(buf); err != nil {
+					if err := conn.WriteWithContext(subCtx, buf); err != nil {
+						if subCtx.Err() != nil {
+							return
+						}
 						p.client.warning("send dummy packet failed: %v", err)
 					}
-				case <-ctx.Done():
+				case <-subCtx.Done():
 					return
 				}
 			}
@@ -245,7 +293,7 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 
 	// Block until reconnection is confirmed by the arrival of valid QUIC/KCP packets,
 	// or abort if no server response is received before the heartbeat deadline.
-	if err := p.serverChecker.waitReconnect(ctx); err != nil {
+	if err := p.serverChecker.waitReconnect(subCtx); err != nil {
 		p.clearBackendConn(conn)
 		return fmt.Errorf("wait for server response failed: %v", err)
 	}
@@ -253,16 +301,16 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 	return nil
 }
 
-func (p *clientProxy) dialStream(proxyClient *SshUdpClient, connectTimeout time.Duration) (*serverConnHolder, error) {
+func (p *clientProxy) dialStream(ctx context.Context, proxyClient *SshUdpClient) (*serverConnHolder, error) {
 	if proxyClient != nil {
-		tcpConn, err := proxyClient.DialTimeout(p.serverNet, p.serverAddr, connectTimeout)
+		tcpConn, err := proxyClient.dialContext(p.serverNet, p.serverAddr, ctx)
 		if err != nil {
 			return nil, fmt.Errorf("proxy dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 		}
 		return &serverConnHolder{&tcpServerConn{tcpConn}}, nil
 	}
 
-	hooked, err := p.hookedDial(p.dialTCP, proxyClient, connectTimeout)
+	hooked, err := p.hookedDial(ctx, p.dialTCP, proxyClient)
 	if err != nil {
 		return nil, err
 	}
@@ -335,37 +383,37 @@ func (p *clientProxy) dialStream(proxyClient *SshUdpClient, connectTimeout time.
 		return &serverConnHolder{&tcpServerConn{conn}}, nil
 	}
 
-	serverAddr, err := doWithTimeout(func() (*net.TCPAddr, error) {
-		return net.ResolveTCPAddr(p.serverNet, p.serverAddr)
-	}, connectTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("resolve tcp addr [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
-	}
-	tcpConn, err := doWithTimeout(func() (*net.TCPConn, error) {
-		return net.DialTCP(p.serverNet, nil, serverAddr)
-	}, connectTimeout)
+	dialer := &net.Dialer{}
+	rawConn, err := dialer.DialContext(ctx, p.serverNet, p.serverAddr)
 	if err != nil {
 		return nil, fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 	}
+
+	tcpConn, ok := rawConn.(*net.TCPConn)
+	if !ok {
+		_ = rawConn.Close()
+		return nil, fmt.Errorf("dial [%s] [%s] returned unexpected connection type: %T", p.serverNet, p.serverAddr, rawConn)
+	}
+
 	setDSCP(tcpConn, kProxyDSCP)
 	_ = tcpConn.SetReadBuffer(kProxyBufferSize)
 	_ = tcpConn.SetWriteBuffer(kProxyBufferSize)
 	return &serverConnHolder{&tcpServerConn{tcpConn}}, nil
 }
 
-func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout time.Duration) (*serverConnHolder, error) {
-	conn, err := p.dialStream(proxyClient, connectTimeout)
+func (p *clientProxy) renewTcpPath(ctx context.Context, proxyClient *SshUdpClient) (*serverConnHolder, error) {
+	conn, err := p.dialStream(ctx, proxyClient)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := p.sendAuthPacket(conn); err != nil {
+	if err := p.sendAuthPacket(ctx, conn); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
 
 	buffer := make([]byte, 256)
-	n, err := doWithTimeout(func() (int, error) { return conn.Read(buffer) }, connectTimeout)
+	n, err := doWithContext(ctx, func() (int, error) { return conn.Read(buffer) })
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("recv auth packet failed: %v", err)
@@ -373,7 +421,7 @@ func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout tim
 
 	if !p.isAuthSuccessful(buffer[:n]) {
 		_ = conn.Close()
-		return nil, fmt.Errorf("proxy auth failed")
+		return nil, errors.New("proxy auth failed")
 	}
 	p.client.debug("serial number [%d] auth success", p.serialNumber)
 
@@ -381,26 +429,34 @@ func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout tim
 }
 
 // hookedDial runs a dial hook for a direct path; nil, nil means use the OS dial.
-func (p *clientProxy) hookedDial(dial func(network, addr string, timeout time.Duration) (net.Conn, error),
-	proxyClient *SshUdpClient, connectTimeout time.Duration) (net.Conn, error) {
+// The hook gets the time left before ctx's deadline.
+func (p *clientProxy) hookedDial(ctx context.Context,
+	dial func(network, addr string, timeout time.Duration) (net.Conn, error),
+	proxyClient *SshUdpClient) (net.Conn, error) {
 	if dial == nil || proxyClient != nil {
 		return nil, nil
 	}
-	conn, err := dial(p.serverNet, p.serverAddr, connectTimeout)
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil, errors.New("context deadline is required")
+	}
+	conn, err := doWithContext(ctx, func() (net.Conn, error) {
+		return dial(p.serverNet, p.serverAddr, time.Until(deadline))
+	})
 	if err != nil {
 		return nil, fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 	}
 	return conn, nil
 }
 
-func (p *clientProxy) renewUdpPath(proxyClient *SshUdpClient, connectTimeout time.Duration) (*serverConnHolder, error) {
+func (p *clientProxy) renewUdpPath(ctx context.Context, proxyClient *SshUdpClient) (*serverConnHolder, error) {
 	var conn *serverConnHolder
-	hooked, err := p.hookedDial(p.dialUDP, proxyClient, connectTimeout)
+	hooked, err := p.hookedDial(ctx, p.dialUDP, proxyClient)
 	if err != nil {
 		return nil, err
 	}
 	if proxyClient != nil {
-		udpConn, err := proxyClient.DialUDP(p.serverNet, p.serverAddr, connectTimeout)
+		udpConn, err := proxyClient.dialUDP(p.serverNet, p.serverAddr, ctx, false)
 		if err != nil {
 			return nil, fmt.Errorf("proxy dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 		}
@@ -408,9 +464,9 @@ func (p *clientProxy) renewUdpPath(proxyClient *SshUdpClient, connectTimeout tim
 	} else if hooked != nil {
 		conn = &serverConnHolder{&udpServerConn{hooked}}
 	} else {
-		serverAddr, err := doWithTimeout(func() (*net.UDPAddr, error) {
+		serverAddr, err := doWithContext(ctx, func() (*net.UDPAddr, error) {
 			return net.ResolveUDPAddr(p.serverNet, p.serverAddr)
-		}, connectTimeout)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("resolve udp addr [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 		}
@@ -424,12 +480,8 @@ func (p *clientProxy) renewUdpPath(proxyClient *SshUdpClient, connectTimeout tim
 		conn = &serverConnHolder{&udpServerConn{udpConn}}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
-	defer cancel()
-
 	done := make(chan error, 1)
 	go func() {
-		defer close(done)
 		buffer := make([]byte, 256)
 		for ctx.Err() == nil {
 			n, err := conn.Read(buffer)
@@ -448,7 +500,7 @@ func (p *clientProxy) renewUdpPath(proxyClient *SshUdpClient, connectTimeout tim
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	if err := p.sendAuthPacket(conn); err != nil {
+	if err := p.sendAuthPacket(ctx, conn); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("send auth packet failed: %v", err)
 	}
@@ -456,33 +508,50 @@ func (p *clientProxy) renewUdpPath(proxyClient *SshUdpClient, connectTimeout tim
 	for {
 		select {
 		case err := <-done:
-			return conn, err
+			if err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			return conn, nil
 		case <-ticker.C:
-			if err := p.sendAuthPacket(conn); err != nil {
+			if err := p.sendAuthPacket(ctx, conn); err != nil {
 				_ = conn.Close()
 				return nil, fmt.Errorf("send auth packet failed: %v", err)
 			}
 		case <-ctx.Done():
 			_ = conn.Close()
-			return nil, fmt.Errorf("renew path to [%s] [%s] timeout [%v]", p.serverNet, p.serverAddr, connectTimeout)
+			return nil, fmt.Errorf("renew path to [%s] [%s] failed: %v", p.serverNet, p.serverAddr, ctx.Err())
 		}
 	}
 }
 
-func (p *clientProxy) sendAuthPacket(conn PacketConn) error {
-	data := make([]byte, 16)
+func (p *clientProxy) sendAuthPacket(ctx context.Context, conn PacketConn) error {
+	data := make([]byte, 16, 20+kClientNonceSize)
 	binary.BigEndian.PutUint64(data[0:8], p.clientID)
 	binary.BigEndian.PutUint64(data[8:16], p.serialNumber)
+	if p.client.protoVersion >= 3 {
+		// Announce the protocol version and the client nonce, so that the
+		// server knows how the following KCP packets are protected before the
+		// first one arrives.
+		data = binary.BigEndian.AppendUint32(data, uint32(p.client.protoVersion))
+		data = append(data, p.clientNonce...)
+	}
 	buf := aesEncrypt(p.cipherBlock, data)
 	if buf == nil {
-		return fmt.Errorf("aes encrypt failed")
+		return errors.New("aes encrypt failed")
 	}
-	return conn.Write(buf)
+	return conn.WriteWithContext(ctx, buf)
 }
 
 func (p *clientProxy) isAuthSuccessful(buf []byte) bool {
 	data := aesDecrypt(p.cipherBlock, buf)
-	if len(data) != 16 {
+	if p.client.protoVersion >= 3 {
+		// The server echoes the client nonce, so that an acknowledgment
+		// sent to an earlier client with the same server info is not accepted.
+		if len(data) != 16+kClientNonceSize || !bytes.Equal(data[16:], p.clientNonce) {
+			return false
+		}
+	} else if len(data) != 16 {
 		return false
 	}
 	serverID := binary.BigEndian.Uint64(data[0:8])
@@ -512,7 +581,9 @@ func (p *clientProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 				continue
 			}
 
-			p.serverChecker.updateNow()
+			if !p.kcpAliveCheck {
+				p.serverChecker.updateNow()
+			}
 
 			p.cumTraffic.recvPackets.Add(1)
 			p.cumTraffic.recvBytes.Add(uint64(n))
@@ -571,10 +642,6 @@ func (p *clientProxy) Close() error {
 	p.clearBackendConn(nil)
 
 	p.serverChecker.Close()
-
-	if p.kcpCrypto != nil {
-		p.kcpCrypto.Close()
-	}
 
 	return nil
 }
@@ -662,6 +729,11 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 		clientID = binary.BigEndian.Uint64(buf)
 	}
 
+	clientNonce := make([]byte, kClientNonceSize)
+	if _, err := crypto_rand.Read(clientNonce); err != nil {
+		return nil, fmt.Errorf("rand client nonce failed: %v", err)
+	}
+
 	var proxyCmds []string
 	if opts.ProxyCommand != "" {
 		proxyCmds, err = splitCommandLine(opts.ProxyCommand)
@@ -672,6 +744,7 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 
 	proxy := &clientProxy{
 		client:        client,
+		renewMutex:    make(chan struct{}, 1),
 		proxyMode:     opts.ServerInfo.ProxyMode,
 		serverNet:     network,
 		serverAddr:    opts.TsshdAddr,
@@ -683,6 +756,10 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 		proxyCmds:     proxyCmds,
 		dialTCP:       opts.DialTCP,
 		dialUDP:       opts.DialUDP,
+		udpTraffic:    &trafficStats{},
+		clientNonce:   clientNonce,
+		// Before protocol version 3, KCP cannot tell a replayed packet apart.
+		kcpAliveCheck: opts.ServerInfo.Mode == kUdpModeKCP && client.protoVersion >= 3,
 	}
 	proxy.backendCond = sync.NewCond(&proxy.backendMutex)
 
@@ -693,8 +770,6 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 		proxy.serverChecker.onReconnected(func() {
 			client.debug("resumed after receiving server output")
 		})
-
-		proxy.udpTraffic = &trafficStats{}
 
 		go func() {
 			ticker := time.NewTicker(200 * time.Millisecond)
